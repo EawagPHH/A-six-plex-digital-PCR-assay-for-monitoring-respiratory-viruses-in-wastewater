@@ -1,0 +1,3151 @@
+---
+title: "Manuscript RESPV6 and Swiss Monitoring: Analysis and Plots"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+# suppress warnings and messages to create neat final output
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+# Intro
+
+This notebook generates summary statistics and plots for the manuscript “A six-plex digital PCR assay for monitoring respiratory viruses in Swiss wastewater”, which describes the development of the RESPV6 assay and its first year of implementation.
+Data is taken directly from the WISEdb (https://wisedb.ethz.ch), the Federal Office of Public Health in Switzerland (FOPH) public API (https://api.idd.bag.admin.ch/swagger-ui/api-doc.html) and from files shared directly from the FOPH .
+To run this locally you need to have an access token for the WISEdb API and the case data shared from the FOPH. Requests for a WISEdb API token can be made to the Pathogens and Human Health group at Eawag, case data must be requested from the FOPH directly.
+
+```{r libraries}
+reticulate::use_miniconda('r-reticulate') # See documentation for initial installation to make this work
+library(tidyverse)
+library(RCurl)
+library(jsonlite)
+library(plotly)
+library(zoo)
+library(FSA)
+library(dunn.test)
+library(readxl)
+library(broom)
+```
+
+# Data Import
+
+## WISE database
+
+```{r wisedb data import}
+# define date range for analysis
+from_date <- "2023-07-10"
+to_date <- "2024-07-22"
+
+get_data <- function(url, token, accept) {
+  full_url <- URLencode(url)
+  if (str_detect(accept, "csv")) {
+    csv <- getURL(full_url, httpheader = c(Accept = accept, authorization = paste0("Token ", token)))
+    df <- read.csv(text = csv, sep = ",", header = TRUE, stringsAsFactors = FALSE)
+    if (nrow(df) == 0) {
+      stop(paste("No data received from", url))
+    }
+  } else if (str_detect(accept, "json")) {
+    json <- getURL(full_url, httpheader = c(Accept = accept, authorization = paste0("Token ", token)))
+    df <- parse_json(json, simplifyVector = TRUE)
+    if (length(df) == 0) {
+      stop(paste("No data received from", url))
+    }
+  }
+  return(df[-1]) # Return w/o index
+}
+
+# Configure API for reading data
+readRenviron(".env")
+api <- "https://wisedb.ethz.ch/api/"
+token <- Sys.getenv("WISEDB_TOKEN")
+
+# URls for data
+pcr_url <- paste0(api, "export/dpcr/?spiked=False&from=", from_date, "&to=", to_date)
+spiked_url <- paste0(api, "export/dpcr/?spiked=True&from=", from_date, "&to=", to_date)
+controls_url <- paste0(api, "export/dpcr_control/")
+wwtp_url <- paste0(api, "export/wastewatertreatmentplant/?sampling=True")
+
+wwtp_cities <- list(
+  "ARA Werdhoelzli" = "Zurich",
+  "STEP Aire" = "Geneva",
+  "ARA Basel/Prorheno" = "Basel",
+  "STEP Vidy" = "Lausanne",
+  "ARA Region Bern" = "Bern",
+  "ARA Buholz" = "Lucerne",
+  "CDA Lugano" = "Lugano",
+  "ARA Zuchwil" = "Solothurn",
+  "ARA Altenrhein" = "Altenrhein",
+  "ARA Sensetal" = "Laupen",
+  "ARA Chur" = "Chur",
+  "STEP Neuchatel" = "Neuchatel",
+  "ARA Schwyz" = "Schwyz",
+  "STEP Porrentruy" = "Porrentruy"
+)
+
+# Load PCR data from API
+PCRdata <- get_data(pcr_url, token, "text/csv") %>%
+  rename(`1-inhibition` = inhibition) %>%
+  mutate(collection_date = ymd(collection_date),
+         inhibition = 1 - `1-inhibition`,
+         dead_volume = (25 - 0.000519 * total_droplets) / 25, # inhibition reported for the paper is 1 - our calculated "inhibition"
+         city = recode(wastewater_treatment_plant.name, !!!wwtp_cities))
+
+Spikeddata <- get_data(spiked_url, token, "text/csv") %>%
+  mutate(collection_date = ymd(collection_date))
+
+Controldata <- get_data(controls_url, token, "text/csv") %>%
+  mutate(run_timestamp = ymd_hms(run_timestamp)) %>%
+  filter(between(run_timestamp, ymd(from_date), ymd(to_date)))
+
+# Load wwtp info from API
+wwtps <- get_data(wwtp_url, token, "application/json") %>%
+  mutate(across(.cols = c("canton", "name"), .fns = factor))
+```
+
+### Data modifications
+
+```{r modified PCRdata dataframes}
+# dataframe for comparing SARS-N1 and -N2 measurements
+N1.N2.plot.data <- PCRdata %>%
+  filter(passed == "True",
+         target == "SARS-N1" | target == "SARS-N2") %>%
+  group_by(wastewater_treatment_plant.name, city, collection_date, target) %>%
+  summarise(avg_gc_per_lww = mean(gc_per_lww, na.rm = TRUE)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = "target", values_from = "avg_gc_per_lww") %>%
+  mutate(ratio = ifelse(`SARS-N2` != 0, `SARS-N1` / `SARS-N2`, NA))
+
+# generates data set where technical replicates are averaged and rolling median calculated
+# grouped at the wwtp and target level
+avgData <- PCRdata %>%
+  filter(passed == "True") %>%
+  group_by(wastewater_treatment_plant.name, 
+           wastewater_treatment_plant.ara_id, 
+           city,
+           target, collection_date) %>%
+  summarise(load = mean(load, na.rm = TRUE), .groups = "drop") %>%
+  ungroup() %>%
+  group_by(wastewater_treatment_plant.name, target) %>%
+  tidyr::complete(collection_date = full_seq(collection_date, period = 1),
+                  fill = list(load = NA)) %>%
+  mutate(load_median = rollapply(load,
+                                 width = 7,
+                                 FUN = function(x) median(x, na.rm = TRUE),
+                                 align = "center",
+                                 fill = TRUE,
+                                 partial = TRUE)) %>%
+  drop_na(load) %>%
+  ungroup()
+
+# dataframe for investigating recovery statistics
+df_recovery <- PCRdata %>%
+  filter(target == "MHV",
+         passed == "True",
+         gc_per_lww >= lod)
+
+# dataframe for investigating inhibition statistics
+df_inhibition <- PCRdata %>%
+  filter(target == "SARS-N1",
+         passed == "True")
+```
+
+## BAG REST API access
+
+NOTE: All data from the BAG comes with weekly data points
+
+```{r get bag data}
+get_bag_data <- function(url, type) {
+  full_url <- URLencode(paste0(url, type))
+  if (str_detect(type, "csv")) {
+    df <- read.csv(full_url)
+    if (nrow(df) == 0) {
+      stop(paste("No data received from", url))
+    }
+  } else if (str_detect(accept, "json")) {
+    json <- getURL(full_url, httpheader = c(Accept = "*/*"))
+    df <- parse_json(json, simplifyVector = TRUE)
+    if (length(df) == 0) {
+      stop(paste("No data received from", url))
+    }
+  }
+  return(df) # Return w/o index
+}
+
+# Configure API for reading data
+api_bag <- "https://idd.bag.admin.ch/api/"
+
+# URls for data
+resp_viruses_url <- paste0(api_bag, "v1/export/current/RESPVIRUSES_sentinella/")
+influenza_url <- paste0(api_bag, "v1/export/current/INFLUENZA_oblig/")
+sars_url <- paste0(api_bag, "v1/export/current/COVID19_oblig/")
+
+# Load Sentinella data from API
+SentinellaData <- get_bag_data(resp_viruses_url, "csv") %>%
+  filter(testResult == "positive") %>%
+  select(temporal, pathogen, type, value) %>%
+  mutate(pathogen_abbr = as.factor(ifelse(pathogen == "respiratory_syncytial_virus", "RSV", 
+                                          ifelse(pathogen == "sars-cov-2", "SARS", 
+                                                 ifelse(pathogen == "influenza" & type == "A", "IAV",
+                                                        ifelse(pathogen == "influenza" & type == "B", "IBV", pathogen)))))) %>%
+  group_by(temporal, pathogen_abbr) %>%
+  summarise(sentinella = sum(value), .groups = "drop")
+
+# Load Influenza data from API
+InfluenzaData <- get_bag_data(influenza_url, "csv") %>%
+  filter(georegion == "CHFL", 
+         type == "A" | type == "B") %>% # There is only A/B level data for the whole of Switzerland and Lichtenstein
+  mutate(pathogen = ifelse(type == "A", "IAV", "IBV")) %>%
+  select(temporal, pathogen, pop, value) %>%
+  mutate(cases_per_person = value/pop)
+
+# Load SARS data from API
+SARSData <- get_bag_data(sars_url, "csv") %>%
+  filter(testResult == "positive") %>%
+  group_by(temporal, georegion, pop) %>%
+  summarize(value = mean(value, na.rm = TRUE)) %>%
+  mutate(pathogen = "SARS",
+         cases_per_person = value/pop) %>%
+  select(temporal, georegion, pathogen, pop, value, cases_per_person) 
+```
+
+### Influenza sentinella vs mandatory comparison
+
+```{r}
+get_bag_data(resp_viruses_url, "csv") %>%
+  filter(testResult == "positive",
+         pathogen == "influenza",
+         type == "A" | type == "B") %>%
+  select(temporal, type, value) %>%
+  mutate(type = factor(type)) %>%
+  group_by(temporal, type) %>%
+  summarise(sentinella = sum(value), .groups = "drop") %>%
+  group_by(type) %>%
+  summarise(total_sentinella = sum(sentinella), .groups = "drop") %>%
+  mutate(percent = total_sentinella/sum(total_sentinella))
+
+get_bag_data(influenza_url, "csv") %>%
+  filter(georegion == "CHFL",
+         type == "A" | type == "B") %>%
+  select(temporal, type, value) %>%
+  mutate(type = factor(type)) %>%
+  group_by(temporal, type) %>%
+  summarise(mandatory = sum(value), .groups = "drop") %>%
+  group_by(type) %>%
+  summarise(total_mandatory = sum(mandatory), .groups = "drop") %>%
+  mutate(percent = total_mandatory/sum(total_mandatory))
+```
+
+### Data modifications
+
+```{r modified case data dataframes}
+# Country level case data for SARS and Influenza
+CaseData <- SARSData %>%
+  filter(georegion == "CH") %>%
+  select(-georegion) %>%
+  bind_rows(InfluenzaData)
+
+# Canton level case data for SARS only
+SARScantons <- SARSData %>%
+  left_join(wwtps, by = c("georegion" = "canton")) %>%
+  filter(!is.na(name))
+```
+
+### Joining dpcr and case data
+
+```{r joining dpcr and case data}
+# Swiss wide comparrison for sentinella and cases
+swissAvgData <- avgData %>%
+  filter(target != "MHV", target != "SARS-N2") %>%
+  group_by(target, collection_date) %>%
+  summarise(mean_load = mean(load, na.rm = TRUE),
+            median_load = median(load, na.rm = TRUE),
+            .groups = "drop") %>%
+  group_by(target) %>%
+  tidyr::complete(collection_date = full_seq(collection_date, period = 1),
+                  fill = list(mean_load = NA)) %>%
+  mutate(load_median = rollapply(median_load,
+                                 width = 7,
+                                 FUN = function(x) median(x, na.rm = TRUE),
+                                 align = "center",
+                                 fill = TRUE,
+                                 partial = TRUE)) %>%
+  drop_na(mean_load) %>%
+  separate(target, c("pathogen", "protein"), sep = "-") %>%
+  mutate(temporal = paste0(isoyear(collection_date), "-W", sprintf("%02d", isoweek(collection_date)))) %>%
+  left_join(SentinellaData, by = c("pathogen" = "pathogen_abbr", "temporal")) %>%
+  left_join(CaseData, by = c("pathogen", "temporal"))
+
+# Aggregating to week level for statistical analysis
+swissAvgDataWeek <- swissAvgData %>%
+  group_by(pathogen, temporal) %>%
+  summarise(weekAvg_load = mean(mean_load, na.rm = TRUE), 
+            weekMed_load = mean(median_load, na.rm = TRUE),
+            sent_cases = first(sentinella),
+            man_cases = first(value),
+            man_cases_per_person = first(cases_per_person),
+            .groups = "drop")
+
+# Canton level comparison for SARS case data only
+cantonData <- avgData %>%
+  filter(target == "SARS-N1") %>%
+  separate(target, c("pathogen", "protein"), sep = "-") %>%
+  mutate(temporal = paste0(isoyear(collection_date), "-W", sprintf("%02d", isoweek(collection_date)))) %>%
+  left_join(SARScantons, by = c("wastewater_treatment_plant.name" = "name", "temporal", "pathogen"))
+
+# Aggregating to week level for statistical analysis
+cantonDataWeek <- cantonData %>%
+  group_by(wastewater_treatment_plant.name, city, temporal) %>%
+  summarise(weekAvg_load = mean(load, na.rm = TRUE), 
+            cases = first(value),
+            cases_per_person = first(cases_per_person), 
+            georegion = first(georegion),
+            .groups = "drop")
+```
+
+## Canton daily data shared by FOPH
+
+```{r}
+# They miss the population variable, take this from the publically available mandatory reporting 
+CantonPop <- cantonData %>%
+  select(wastewater_treatment_plant.ara_id, pop, georegion) %>% 
+  distinct() %>%
+  rename(cant_pop = pop,
+         canton = georegion)
+```
+
+### SARS-Cov-2
+
+```{r}
+dailySARScantonal <- read_csv("2024-08-19_covid_tests_cases_ktn_daily.csv", show_col_types = FALSE) %>%
+  rename(collection_date = date,
+         canton_name = canton,
+         canton = canton_abbr) %>%
+  mutate(collection_date = ymd(collection_date)) %>%
+  left_join(wwtps, by = "canton") %>%
+  rename(wastewater_treatment_plant.ara_id = ara_id) %>%
+  left_join(filter(avgData, target == "SARS-N1"), 
+            by = c("collection_date", "wastewater_treatment_plant.ara_id")) %>%
+  filter(collection_date >= from_date & collection_date <= to_date, # remove data from before ww monitoring
+         !is.na(wastewater_treatment_plant.name)) %>%
+  left_join(CantonPop, by = c("wastewater_treatment_plant.ara_id", "canton")) %>%
+  select(., collection_date, city, canton, cases, positive, negative, positivity, wastewater_treatment_plant.name, load, load_median, cant_pop) %>%
+  mutate(cases_pop = cases / cant_pop * 100000) # Express cases by 100'000 people
+```
+
+### Influenza A
+
+```{r}
+dailyIAVcantonal <- read_csv("2024-08-19_influA_cases_ktn_daily.csv", show_col_types = FALSE) %>%
+  rename(collection_date = date,
+         canton_name = canton,
+         canton = canton_abbr) %>%
+  mutate(collection_date = ymd(collection_date)) %>%
+  left_join(wwtps, by = "canton") %>%
+  rename(wastewater_treatment_plant.ara_id = ara_id) %>%
+  left_join(filter(avgData, target == "IAV-M"), 
+            by = c("collection_date", "wastewater_treatment_plant.ara_id")) %>%
+  filter(collection_date >= from_date & collection_date <= to_date, # remove data from before ww monitoring
+         !is.na(wastewater_treatment_plant.name)) %>%
+  left_join(CantonPop, by = c("wastewater_treatment_plant.ara_id", "canton")) %>%
+  select(., collection_date, city, canton, cases, wastewater_treatment_plant.name, load, load_median, cant_pop) %>%
+  mutate(cases_pop = cases / cant_pop * 100000) # Express cases by 100'000 people
+```
+
+### Influenza B
+
+```{r}
+dailyIBVcantonal <- read_csv("2024-08-19_influB_cases_ktn_daily.csv", show_col_types = FALSE) %>%
+  rename(collection_date = date,
+         canton_name = canton,
+         canton = canton_abbr) %>%
+  mutate(collection_date = ymd(collection_date)) %>%
+  left_join(wwtps, by = "canton") %>%
+  rename(wastewater_treatment_plant.ara_id = ara_id) %>%
+  left_join(filter(avgData, target == "IBV-M"), 
+            by = c("collection_date", "wastewater_treatment_plant.ara_id")) %>%
+  filter(collection_date >= from_date & collection_date <= to_date, # remove data from before ww monitoring
+         !is.na(wastewater_treatment_plant.name)) %>%
+  left_join(CantonPop, by = c("wastewater_treatment_plant.ara_id", "canton")) %>%
+  select(., collection_date, city, canton, cases, wastewater_treatment_plant.name, load, load_median, cant_pop) %>%
+  mutate(cases_pop = cases / cant_pop * 100000) # Express cases by 100'000 people
+```
+
+## Catchment daily data shared by FOPH (SARS-CoV-2 only)
+
+```{r}
+dailySARScatchment <- read_csv("2024-08-19_covid_tests_cases_ara_daily.csv", show_col_types = FALSE) %>%
+  rename(collection_date = date) %>%
+  mutate(collection_date = ymd(collection_date)) %>%
+  left_join(wwtps, by = "ara_id") %>%
+  left_join(filter(avgData, target == "SARS-N1"), 
+            by = c("collection_date", "ara_id" = "wastewater_treatment_plant.ara_id")) %>%
+  filter(collection_date >= from_date & collection_date <= to_date, # remove data from before ww monitoring
+         !is.na(wastewater_treatment_plant.name)) %>%
+  select(., collection_date, city, canton, cases, positive, negative, positivity, wastewater_treatment_plant.name, load, load_median, population) %>%
+  mutate(cases_pop = cases / population * 100000) # Express cases by 100'000 people
+```
+
+## Population proportion
+
+```{r}
+CantonPop %>% 
+  left_join(wwtps, by = c("wastewater_treatment_plant.ara_id" = "ara_id", "canton")) %>%
+  select(wastewater_treatment_plant.ara_id, name, population, cant_pop) %>%
+  mutate(prop_rep = population / cant_pop) %>%
+  arrange(prop_rep) %>%
+  {. ->> populationProportion } %>%
+  print()
+```
+
+## Plotting parameters
+
+```{r plot-settings}
+# define the margins for plots
+m <- list(
+  l = 100,
+  r = 100,
+  b = 100,
+  t = 100,
+  pad = 4
+)
+
+# define two groups of targets
+sars.targets <- c("SARS-N1", "SARS-N2")
+flu.targets <- c("IAV-M", "IBV-M", "RSV-N")
+
+# define full names
+target_full_names <- c("SARS-N1" = "SARS-CoV-2", "SARS-N2" = "SARS-CoV-2", 
+                       "IAV-M" = "Influenza A", "IBV-M" = "Influenza B", 
+                       "RSV-N" = "Respiratory Syncytial Virus")
+
+target_full_names_spec <- c("SARS-N1" = "SARS-CoV-2 (N1)", "SARS-N2" = "SARS-CoV-2 (N2)", 
+                            "IAV-M" = "Influenza A", "IBV-M" = "Influenza B", 
+                            "RSV-N" = "Respiratory Syncytial Virus")
+
+pathogen_full_names <- c("SARS" = "SARS-CoV-2", "IAV" = "Influenza A", 
+                         "IBV" = "Influenza B", "RSV" = "Respiratory Syncytial Virus")
+
+wwtp_letters <- data.frame(wwtp = c(sort(unique(PCRdata$wastewater_treatment_plant.name))),
+                           letter = LETTERS[1:length(unique(PCRdata$wastewater_treatment_plant.name))])
+
+target_letters <- c("SARS-N1" = "D", "SARS-N2" = "E", 
+                    "IAV-M" = "A", "IBV-M" = "B", 
+                    "RSV-N" = "C")
+
+# define colour palettes
+target_colors <- c("#0000FF", "#009999", "#E41A1C", "#006633", "#FA9600")
+target_colors <- setNames(target_colors, c("SARS-N1", "SARS-N2", "IAV-M", "IBV-M", "RSV-N"))
+
+pathogen_colors <- c("#0000FF", "#E41A1C", "#006633", "#FA9600")
+pathogen_colors <- setNames(pathogen_colors, c("SARS", "IAV", "IBV", "RSV"))
+
+target_full_spec_colors <- c("#0000FF", "#009999", "#E41A1C", "#006633", "#FA9600")
+target_full_spec_colors <- setNames(target_full_spec_colors, 
+                                    c("SARS-CoV-2 (N1)", "SARS-CoV-2 (N2)",  
+                                      "Influenza A", "Influenza B", 
+                                      "Respiratory Syncytial Virus"))
+
+wwtp_colors <- c(paletteer::paletteer_d("colorBlindness::paletteMartin")[-1])
+wwtp_colors <- setNames(wwtp_colors, unique(PCRdata$city))
+```
+
+# Results
+
+## dPCR data quality and assay performance
+
+### Pass/Failure rates
+
+```{r}
+normal <- PCRdata %>% 
+  distinct(chamber_id) %>%
+  count()
+
+spiked <- Spikeddata %>% 
+  distinct(chamber_id) %>%
+  count()
+
+controls <- Controldata %>% 
+  distinct(run_timestamp, pcr_identifier, type, total_droplets) %>%
+  count()
+
+print(paste("Normal chambers run:", normal))
+print(paste("Spiked chambers run:", spiked))
+print(paste("Control chambers run:", controls))
+print(paste("Total chambers run:", normal + spiked + controls))
+```
+
+Technical replicates that passed all quality control measures (total number of droplets, NTC, inhibition)
+
+```{r}
+normal_passed <- PCRdata %>%
+  filter(passed == "True") %>%
+  distinct(chamber_id) %>%
+  count()
+
+normal_failed <- PCRdata %>%
+  filter(passed == "False") %>%
+  distinct(chamber_id) %>%
+  count()
+
+normal_failed_ntc <- PCRdata %>%
+  filter(ntc_passed == "False") %>%
+  distinct(chamber_id) %>%
+  count()
+
+normal_failed_inhibition <- PCRdata %>%
+  filter(inhibition_passed == "False") %>%
+  distinct(chamber_id) %>%
+  count()
+
+normal_failed_total_droplets <- PCRdata %>%
+  filter(total_droplets_passed == "False") %>%
+  distinct(chamber_id) %>%
+  count()
+
+print(paste("Normal chambers passed QC:", normal_passed, "(", round(normal_passed/normal*100, digits = 2), "% )"))
+print(paste("Normal chambers failed QC:", normal_failed, "(", round(normal_failed/normal*100, digits = 2), "% )"))
+print(paste("Normal chambers failed due to inhibition:", normal_failed_inhibition, "(", round(normal_failed_inhibition/normal_failed*100, digits = 2), "% )"))
+print(paste("Normal chambers failed due to droplets:", normal_failed_total_droplets, "(", round(normal_failed_total_droplets/normal_failed*100, digits = 2), "% )"))
+print(paste("Normal chambers failed due to NTCs:", normal_failed_ntc, "(", round(normal_failed_ntc/normal_failed*100, digits = 2), "% )"))
+```
+Total number of wastewater samples analysed
+
+```{r}
+PCRdata %>%
+  filter(passed == "True") %>%
+  distinct(collection_date, wastewater_treatment_plant.name) %>%
+  count()
+```
+Samples taken from only a single technical replicate.
+
+```{r}
+PCRdata %>%
+  filter(passed == "True",
+         target != "MHV") %>%
+  count(wastewater_treatment_plant.name, collection_date, target) %>%
+  group_by(wastewater_treatment_plant.name, collection_date) %>%
+  summarise(replicates = min(n)) %>%
+  filter(replicates == 1) %>%
+  ungroup() %>%
+  count()
+```
+
+### Partitions 
+
+Descriptive statistics: non-spiked reactions
+
+```{r}
+PCRdata %>%
+  filter(passed == "True") %>%
+  distinct(chamber_id, total_droplets) %>%
+  select(total_droplets) %>%
+  summarise_each(funs(min = min(., na.rm = TRUE), 
+                      q25 = quantile(., 0.25, na.rm = TRUE), 
+                      median = median(., na.rm = TRUE), 
+                      q75 = quantile(., 0.75, na.rm = TRUE), 
+                      max = max(., na.rm = TRUE),
+                      mean = mean(., na.rm = TRUE), 
+                      sd = sd(., na.rm = TRUE)))
+```
+
+Descriptive statistics: positive controls
+
+```{r}
+Controldata %>%
+  filter(type == "POS") %>%
+  distinct(run_timestamp, pcr_identifier, total_droplets) %>%
+  select(total_droplets) %>%
+  summarise_each(funs(min = min(., na.rm = TRUE), 
+                      q25 = quantile(., 0.25, na.rm = TRUE), 
+                      median = median(., na.rm = TRUE), 
+                      q75 = quantile(., 0.75, na.rm = TRUE), 
+                      max = max(., na.rm = TRUE),
+                      mean = mean(., na.rm = TRUE), 
+                      sd = sd(., na.rm = TRUE)))
+```
+
+Descriptive statistics: negative controls
+
+```{r}
+Controldata %>%
+  filter(type == "NTC") %>%
+  distinct(run_timestamp, pcr_identifier, total_droplets) %>%
+  select(total_droplets) %>%
+  summarise_each(funs(min = min(., na.rm = TRUE), 
+                      q25 = quantile(., 0.25, na.rm = TRUE), 
+                      median = median(., na.rm = TRUE), 
+                      q75 = quantile(., 0.75, na.rm = TRUE), 
+                      max = max(., na.rm = TRUE),
+                      mean = mean(., na.rm = TRUE), 
+                      sd = sd(., na.rm = TRUE)))
+```
+
+### Inhibition (%)
+
+NOTE: calculated for all technical replicates
+
+Descriptive statistics: among all locations
+
+```{r}
+df_inhibition %>%
+  select(inhibition) %>%
+  summarise_each(funs(min = min(., na.rm = TRUE), 
+                      q25 = quantile(., 0.25, na.rm = TRUE), 
+                      median = median(., na.rm = TRUE), 
+                      q75 = quantile(., 0.75, na.rm = TRUE), 
+                      max = max(., na.rm = TRUE),
+                      mean = mean(., na.rm = TRUE), 
+                      sd = sd(., na.rm = TRUE),
+                      count = n()))
+```
+
+Descriptive statistics: stratified by WWTPs
+
+```{r}
+df_inhibition %>%
+  group_by(city) %>%
+  select(inhibition) %>%
+  summarise_each(funs(min = min(., na.rm = TRUE), 
+                      q25 = quantile(., 0.25, na.rm = TRUE), 
+                      median = median(., na.rm = TRUE), 
+                      q75 = quantile(., 0.75, na.rm = TRUE), 
+                      max = max(., na.rm = TRUE),
+                      mean = mean(., na.rm = TRUE), 
+                      sd = sd(., na.rm = TRUE)))
+```
+
+Statistical comparison among WWTPs
+
+```{r}
+# Check for normality and perform Kruskal-Wallis test
+df_inhibition %>%
+  summarise(shapiro_p_value = shapiro.test(inhibition)$p.value,
+            shapiro_statistic = shapiro.test(inhibition)$statistic, 
+            kruskal_chi = kruskal.test(inhibition ~ wastewater_treatment_plant.name, data = .)$statistic,
+            kruskal_p = kruskal.test(inhibition ~ wastewater_treatment_plant.name, data = .)$p.value) %>%
+  print() %>%
+  { ifelse(.$kruskal_p < 0.05 , # dunn test if kruskal is significant
+           {
+             capture.output(
+               as.data.frame(
+                 
+                 dunnTest(inhibition ~ city, 
+                          data = df_inhibition, 
+                          method = "bonferroni")$res) %>%
+                 mutate(significance = cut(P.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), 
+                                           labels = c("***", "**", "*", ""))) %>%
+                 print() %>%
+                 write.csv(., "SupTable1.csv", row.names = FALSE)
+             )
+           },
+           "Kruskal-Wallis test is not significant; no need for Dunn's test." ) }
+```
+
+Boxplots
+
+```{r}
+inhibition.cutoff <- 50 # define upper limit for visualisation
+
+inhibition.boxplots <- plot_ly(df_inhibition, x = ~city, y = ~inhibition * 100, type = "box") %>%
+  layout(xaxis = list(title = "Location"),
+         yaxis = list(title = "Inhibition (%)", range = c(-inhibition.cutoff, inhibition.cutoff)))
+
+inhibition.boxplots
+```
+
+Datapoints removed from plot
+
+```{r}
+df_recovery %>%
+  filter(inhibition > inhibition.cutoff) %>%
+  select(wastewater_treatment_plant.name, collection_date, inhibition)
+```
+
+### MHV Recovery (%)
+
+NOTE: Recovery statistics are calculated using only samples above lod and for individual technical replicates
+
+Descriptive statistics: among all WWTPs
+
+```{r}
+df_recovery %>%
+  select(perc_recovery) %>%
+  summarise_each(funs(min = min(., na.rm = TRUE), 
+                      q25 = quantile(., 0.25, na.rm = TRUE), 
+                      median = median(., na.rm = TRUE), 
+                      q75 = quantile(., 0.75, na.rm = TRUE), 
+                      max = max(., na.rm = TRUE),
+                      mean = mean(., na.rm = TRUE), 
+                      sd = sd(., na.rm = TRUE),
+                      count = n()))
+```
+
+Descriptive statistics: stratified by WWTPs
+
+```{r}
+df_recovery %>%
+  group_by(city) %>%
+  select(perc_recovery) %>%
+  summarise_each(funs(min = min(., na.rm = TRUE), 
+                      q25 = quantile(., 0.25, na.rm = TRUE), 
+                      median = median(., na.rm = TRUE), 
+                      q75 = quantile(., 0.75, na.rm = TRUE), 
+                      max = max(., na.rm = TRUE),
+                      mean = mean(., na.rm = TRUE), 
+                      sd = sd(., na.rm = TRUE)))
+```
+
+Statistical comparison among WWTPs
+
+```{r}
+# Check for normality and perform Kruskal-Wallis test
+df_recovery %>%
+  summarise(shapiro_p_value = shapiro.test(perc_recovery)$p.value,
+            shapiro_statistic = shapiro.test(perc_recovery)$statistic, # not normal
+            kruskal_chi = kruskal.test(perc_recovery ~ city, data = .)$statistic,
+            kruskal_p = kruskal.test(perc_recovery ~ city, data = .)$p.value) %>%
+  print() %>%
+  { ifelse(.$kruskal_p < 0.05 , # dunn test if kruskal is significant
+           {
+             capture.output(
+               as.data.frame(
+                 
+                 dunnTest(perc_recovery ~ city, 
+                          data = df_recovery, 
+                          method = "bonferroni")$res) %>%
+                 mutate(significance = cut(P.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), 
+                                           labels = c("***", "**", "*", ""))) %>%
+                 print() %>%
+                 write.csv(., "SupTable2.csv", row.names = FALSE))
+           },
+           "Kruskal-Wallis test is not significant; no need for Dunn's test." ) }
+```
+
+Boxplots
+
+```{r}
+recovery.cutoff <- 120 # define upper limit for visualisation
+
+recovery.boxplots <- plot_ly(df_recovery, x = ~city, y = ~perc_recovery, type = "box") %>%
+  layout(xaxis = list(title = "Location"),
+         yaxis = list(title = "MHV Recovery (%)", range = c(0, recovery.cutoff)))
+
+recovery.boxplots
+```
+
+Datapoints removed from plot
+
+```{r}
+df_recovery %>%
+  filter(perc_recovery > recovery.cutoff) %>%
+  select(city, collection_date, perc_recovery)
+```
+
+### Dead volume
+
+Descriptive statistics
+
+```{r}
+PCRdata %>%
+  filter(passed == "True") %>%
+  distinct(chamber_id, dead_volume) %>%
+  select(dead_volume) %>%
+  summarise_each(funs(min = min(., na.rm = TRUE), 
+                      q25 = quantile(., 0.25, na.rm = TRUE), 
+                      median = median(., na.rm = TRUE), 
+                      q75 = quantile(., 0.75, na.rm = TRUE), 
+                      max = max(., na.rm = TRUE),
+                      mean = mean(., na.rm = TRUE), 
+                      sd = sd(., na.rm = TRUE)))
+```
+
+```{r}
+PCRdata %>%
+  group_by(city) %>%
+  filter(passed == "True") %>%
+  distinct(chamber_id, dead_volume) %>%
+  select(dead_volume) %>%
+  summarise_each(funs(min = min(., na.rm = TRUE), 
+                      q25 = quantile(., 0.25, na.rm = TRUE), 
+                      median = median(., na.rm = TRUE), 
+                      q75 = quantile(., 0.75, na.rm = TRUE), 
+                      max = max(., na.rm = TRUE),
+                      mean = mean(., na.rm = TRUE), 
+                      sd = sd(., na.rm = TRUE)))
+```
+
+```{r}
+# Check for normality and perform Kruskal-Wallis test
+PCRdata %>%
+  group_by(city) %>%
+  filter(passed == "True") %>%
+  distinct(chamber_id, dead_volume) %>%
+  summarise(kruskal_chi = kruskal.test(dead_volume ~ city, data = .)$statistic,
+            kruskal_p = kruskal.test(dead_volume ~ city, data = .)$p.value) %>%
+  print() %>%
+  { ifelse(.$kruskal_p < 0.05 , # dunn test if kruskal is significant
+           {
+             capture.output(
+               as.data.frame(
+                 
+                 dunnTest(dead_volume ~ city, 
+                          data = PCRdata, 
+                          method = "bonferroni")$res) %>%
+                 mutate(significance = cut(P.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), 
+                                           labels = c("***", "**", "*", ""))) 
+             )
+           },
+           "Kruskal-Wallis test is not significant; no need for Dunn's test." ) }
+```
+
+## Detection of in wastewater samples
+
+Samples (no longer technical replicates/chambers) with detected viral targets. Expressed in percentage (%).
+
+### LOD
+
+Samples above lod.
+
+```{r}
+PCRdata %>%
+  filter(passed == "True",
+         target != "MHV") %>%
+  group_by(wastewater_treatment_plant.name, collection_date, target) %>%
+  summarise(avg_gc_per_lww = max(gc_per_lww, na.rm = TRUE),
+            avg_lod = max(lod, na.rm = TRUE)) %>%
+  mutate(detected = if_else(avg_gc_per_lww > avg_lod, TRUE, FALSE)) %>%
+  group_by(target) %>%
+  select(detected) %>%
+  summarise_each(funs(perc_detected = sum(., na.rm = TRUE) / n() * 100,
+                      count_detected = sum(., na.rm = TRUE)))
+```
+
+### LOQ
+
+Samples above loq.
+
+```{r}
+PCRdata %>%
+  filter(passed == "True",
+         target != "MHV") %>%
+  group_by(wastewater_treatment_plant.name, collection_date, target) %>%
+  summarise(avg_gc_per_lww = max(gc_per_lww, na.rm = TRUE),
+            avg_loq = max(loq, na.rm = TRUE)) %>%
+  mutate(quantified = if_else(avg_gc_per_lww > avg_loq, TRUE, FALSE)) %>%
+  group_by(target) %>%
+  select(quantified) %>%
+  summarise_each(funs(perc_quantified = sum(., na.rm = TRUE) / n() * 100,
+                      count_quantified = sum(., na.rm = TRUE)))
+```
+
+## N1 and N2 relationship
+
+### Correlation
+
+```{r}
+# linear regression
+N1.N2.lm <- lm(`SARS-N2` ~ `SARS-N1`, data = N1.N2.plot.data)
+N1.N2.lm.summary <- summary(N1.N2.lm)
+
+summary(N1.N2.lm)
+
+# Extract the coefficient and set up the equation and R2
+intercept <- N1.N2.lm.summary$coefficients[1, 1]
+slope <- N1.N2.lm.summary$coefficients[2, 1]
+r_squared <- N1.N2.lm.summary$r.squared
+equation <- paste0("y = ", round(intercept, 2), " + ", round(slope, 2), "x")
+r2 <- paste0("R² = ", round(r_squared, 2))
+
+# linear regression filtering out the outlier
+N1.N2.lm.filt <- lm(`SARS-N2` ~ `SARS-N1`, data = filter(N1.N2.plot.data, 
+                                                         `SARS-N1` <= N1.N2.cutoff, 
+                                                         `SARS-N2` <= N1.N2.cutoff))
+N1.N2.lm.filt.summary <- summary(N1.N2.lm.filt)
+
+summary(N1.N2.lm.filt)
+
+# Extract the coefficient and set up the equation and R2
+intercept.filt <- N1.N2.lm.filt.summary$coefficients[1, 1]
+slope.filt <- N1.N2.lm.filt.summary$coefficients[2, 1]
+r_squared.filt <- N1.N2.lm.filt.summary$r.squared
+equation.filt <- paste0("y = ", round(intercept.filt, 2), " + ", round(slope.filt, 2), "x")
+r2.filt <- paste0("R² = ", round(r_squared.filt, 2))
+
+# linear regression pre mutation
+N1.N2.lm.pre <- lm(`SARS-N2` ~ `SARS-N1`, data = filter(N1.N2.plot.data,
+                                                        collection_date < "2024-01-01"))
+N1.N2.lm.summary.pre <- summary(N1.N2.lm.pre)
+
+summary(N1.N2.lm.pre)
+
+# Extract the coefficient and set up the equation and R2
+intercept.pre <- N1.N2.lm.summary.pre$coefficients[1, 1]
+slope.pre <- N1.N2.lm.summary.pre$coefficients[2, 1]
+r_squared.pre <- N1.N2.lm.summary.pre$r.squared
+equation.pre <- paste0("y = ", round(intercept.pre, 2), " + ", round(slope.pre, 2), "x")
+r2.pre <- paste0("R² = ", round(r_squared.pre, 2))
+
+# linear regression post mutation
+N1.N2.lm.post <- lm(`SARS-N2` ~ `SARS-N1`, data = filter(N1.N2.plot.data,
+                                                         collection_date >= "2024-01-01"))
+N1.N2.lm.summary.post <- summary(N1.N2.lm.post)
+
+summary(N1.N2.lm.post)
+
+# Extract the coefficient and set up the equation and R2
+intercept.post <- N1.N2.lm.summary.post$coefficients[1, 1]
+slope.post <- N1.N2.lm.summary.post$coefficients[2, 1]
+r_squared.post <- N1.N2.lm.summary.post$r.squared
+equation.post <- paste0("y = ", round(intercept.post, 2), " + ", round(slope.post, 2), "x")
+r2.post <- paste0("R² = ", round(r_squared.post, 2))
+```
+
+### Plot
+
+```{r}
+max.limit <- 1e8 # for consistent axis limit for regression line
+
+# plot data
+N1.N2.plot <- plot_ly(data = N1.N2.plot.data) %>%
+  add_trace(x = ~`SARS-N1`,
+            y = ~`SARS-N2`,
+            type = "scatter",
+            mode = "markers",
+            marker = list(size = 5,
+                          color = "#000000",
+                          opacity = 0.5)) %>%
+  add_lines(x = c(0, max.limit * 10),
+            y = c(intercept, intercept + slope * (max.limit * 10)),
+            type = "scatter",
+            mode = "lines",
+            line = list(color = "blue",
+                        dash = "solid"),
+            name = "Regression Line",
+            showlegend = FALSE) %>%
+  layout(title = "",
+         autosize = F,
+         width = 750, 
+         height = 750,
+         xaxis = list(title = "SARS-CoV-2 RNA concentration according to N1 gene [gc/Lww]",
+                      titlefont = list(size = 14),
+                      tickfont = list(size = 12),
+                      exponentformat  = "power",
+                      type = "log"),
+         yaxis = list(title = paste0(c("SARS-CoV-2 RNA concentration according to N2 gene [gc/Lww]", 
+                                       rep("\n&nbsp;", 1)),
+                                     collapse = ""),
+                      automargin = "width",
+                      titlefont = list(size = 14),
+                      tickfont = list(size = 12),
+                      nticks=6,
+                      exponentformat  = "power",
+                      type = "log"),
+         margin = m,
+         shapes = list(list(
+           type = "line",
+           x0 = 1,
+           x1 = max.limit * 10,
+           xref = "x",
+           y0 = 1,
+           y1 = max.limit * 10,
+           yref = "y",
+           line = list(color = "lightgrey",
+                       dash = "dash")
+         )),
+         legend = list(orientation = "h",
+                       xanchor = "center",
+                       x = 0.5,
+                       y = -0.3,
+                       xref = "paper",
+                       yref = "paper",
+                       traceorder = "normal",
+                       bgcolor = "rgba(255, 255, 255, 0.5)",
+                       bordercolor = "black",
+                       borderwidth = 1,
+                       title = list(text = "Pre January 2024")),
+         annotations = list(
+           list(
+             x = 0.3,
+             y = 0.7,
+             xref = "paper",
+             yref = "paper",
+             text = paste(equation, "<br>", r2),
+             showarrow = FALSE,
+             font = list(size = 14, color = "blue")
+           ))
+  )
+
+save_image(p = N1.N2.plot, file = "Figure2.png", scale = 3)
+
+N1.N2.plot
+```
+
+### N1 to N2 Ratio
+
+```{r}
+N1.N2.plot.data %>%
+  summarise(mean_ratio = mean(ratio, na.rm = TRUE), 
+            sd_ratio = sd(ratio, na.rm = TRUE), 
+            sample_count = n())
+```
+
+```{r}
+N1.N2.plot.data %>%
+  group_by(year(collection_date)) %>%
+  summarise(mean_ratio = mean(ratio, na.rm = TRUE), 
+            sd_ratio = sd(ratio, na.rm = TRUE), 
+            sample_count = n())
+```
+
+```{r}
+N1.N2.ratio.plot.data <- N1.N2.plot.data %>%
+  filter(!is.na(ratio)) %>%
+  nest(data = -city) %>%
+  mutate(m = map(data, loess, 
+                 formula = ratio ~ as.numeric(collection_date), 
+                 span = .5),
+         fitted = map(m, `[[`, "fitted")) %>%
+  select(-m) %>%
+  unnest(cols = c(data, fitted))
+```
+
+```{r}
+ratio.cutoff <- 2
+
+N1.N2.ratio.plot <- N1.N2.ratio.plot.data %>%
+  left_join(wwtp_letters, by = c("wastewater_treatment_plant.name" = "wwtp")) %>%
+  group_by(wastewater_treatment_plant.name) %>%
+  do(p = plot_ly(data = ., 
+                 x = ~collection_date,
+                 height = 1123,
+                 width = 794) %>%
+       add_trace(y = ~ratio,
+                 type = "scatter",
+                 mode = "markers",
+                 name = "ratio",
+                 showlegend = F,
+                 marker = list(size = 4,
+                               symbol = "circle",
+                               line = list(color = "grey", 
+                                           width = 0.5),
+                               color = "white")) %>%
+       add_trace(y = ~fitted,
+                 type = "scatter",
+                 mode = "lines",
+                 name = "loess fitted",
+                 showlegend = F,
+                 line = list(width = 2,
+                             color = "blue")) %>%
+       add_trace(y = 1,
+                 type = "scatter",
+                 mode = "lines",
+                 showlegend = F,
+                 line = list(width = 0.5,
+                             color = "black",
+                             dash = "dot")) %>%
+       add_annotations(text = ~unique(city),
+                       x = 0.5,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "center",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12)) %>%
+       add_annotations(text = ~unique(letter), 
+                       x = 0,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "left",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12,
+                                   weight = "bold")) %>%
+       layout(title = "",
+              xaxis = list(title = "",
+                           tickformat = "%b %y",
+                           tickangle = 0,
+                           tickfont = list(size = 10),
+                           gridcolor = "gray88",
+                           minor = list(dtick = "%m",
+                                        showgrid = TRUE,
+                                        ticks = "")),
+              yaxis = list(title = "",
+                           range = c(0, ratio.cutoff),
+                           exponentformat  = "power",
+                           nticks = 10,
+                           tickfont = list(size = 10),
+                           gridcolor = "gray88"))) %>% 
+  subplot(nrows = 5,
+          widths = c(1/3, 1/3, 1/3),
+          heights = c(1/5, 1/5, 1/5, 1/5, 1/5),
+          shareX = TRUE,
+          shareY = TRUE,
+          titleY = FALSE,
+          titleX = FALSE) %>%
+  layout(annotations = list(list(x = -0.15 , 
+                                 y = 0.5, 
+                                 text = "Ratio N1 to N2",
+                                 font = list(color = "black",
+                                             size = 12),
+                                 textangle = 270,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48)),
+         margin = m,
+         legend = list(orientation = "v",
+                       xanchor = "right",
+                       yanchor = "bottom",
+                       x = 1,
+                       y = 0, 
+                       xref = "paper",
+                       yref = "paper",
+                       bordercolor = "black",
+                       borderwidth = 1, 
+                       font = list(color = "black", size = 12)))
+
+save_image(p = N1.N2.ratio.plot, file = "SupFigure1.png", scale = 3)
+
+N1.N2.ratio.plot
+```
+
+```{r}
+N1.N2.ratio.plot.data %>%
+  filter(ratio > ratio.cutoff) %>%
+  select(city, collection_date, ratio) %>%
+  print() %>%
+  write_csv(., "SupTable7-FigS1.csv")
+```
+
+## Respiratory viruses loads
+
+Here we plot the viral load in wastewater during the monitoring period.
+
+### SARS-CoV-2
+
+```{r}
+sars.cutoff <- 9e8 # define upper limit for visualisation
+
+sars.loads.plot <- avgData %>%
+  filter(target %in% sars.targets) %>%
+  mutate(title = target_full_names_spec[target]) %>%
+  left_join(wwtp_letters, by = c("wastewater_treatment_plant.name" = "wwtp")) %>%
+  group_by(wastewater_treatment_plant.name) %>%
+  do(p = plot_ly(data = ., 
+                 x = ~collection_date, 
+                 color = ~title,
+                 colors = target_full_spec_colors,
+                 height = 1123,
+                 width = 794,
+                 legendgroup = ~target,
+                 showlegend = ifelse(unique(.$wastewater_treatment_plant.name) == "ARA Werdhoelzli", T, F)) %>%
+       add_trace(y = ~load,
+                 type = "scatter",
+                 mode = "markers",
+                 marker = list(size = 3,
+                               symbol = "circle",
+                               line = list(width = 0.5),
+                               color = "white")) %>%
+       add_trace(y = ~load_median,
+                 name = "7-day Rolling Median",
+                 type = "scatter",
+                 mode = "lines",
+                 line = list(width = 1)) %>%
+       add_annotations(text = ~unique(city),
+                       x = 0.5,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "center",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12)) %>%
+       add_annotations(text = ~unique(letter), 
+                       x = 0,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "left",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12,
+                                   weight = "bold")) %>%
+       layout(title = "",
+              xaxis = list(title = "",
+                           tickformat = "%b %y",
+                           tickangle = 0,
+                           tickfont = list(size = 10),
+                           gridcolor = "gray88",
+                           minor = list(dtick = "%m",
+                                        showgrid = TRUE,
+                                        ticks = "")),
+              yaxis = list(title = "",
+                           range = c(0, sars.cutoff),
+                           exponentformat  = "power",
+                           nticks = 10,
+                           dtick = sars.cutoff / 3,
+                           tickfont = list(size = 10),
+                           gridcolor = "gray88"))) %>% 
+  subplot(nrows = 5,
+          widths = c(1/3, 1/3, 1/3),
+          heights = c(1/5, 1/5, 1/5, 1/5, 1/5),
+          shareX = TRUE,
+          shareY = TRUE,
+          titleY = FALSE,
+          titleX = FALSE) %>%
+  layout(annotations = list(list(x = -0.15 , 
+                                 y = 0.5, 
+                                 text = "Viral RNA Load (gc person<sup>-1</sup> day<sup>-1</sup>)",
+                                 font = list(color = "black",
+                                             size = 12),
+                                 textangle = 270,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48)),
+         margin = m,
+         legend = list(orientation = "v",
+                       xanchor = "right",
+                       yanchor = "bottom",
+                       x = 1,
+                       y = 0, 
+                       xref = "paper",
+                       yref = "paper",
+                       bordercolor = "black",
+                       borderwidth = 1, 
+                       font = list(color = "black", size = 12)))
+
+save_image(p = sars.loads.plot, file = "Figure3.png", scale = 3)
+
+sars.loads.plot
+```
+
+Points cut off from visualisation
+
+```{r}
+avgData %>%
+  filter(target %in% sars.targets,
+         load > sars.cutoff) %>%
+  select(city, target, collection_date, load) %>%
+  print() %>%
+  write_csv(., "SupTable7-Fig3.csv")
+```
+
+### Influenza and RSV
+
+```{r}
+flu.cutoff <- 6e7 # define upper limit for visualisation
+
+flu.loads.plot <- avgData %>%
+  filter(target %in% flu.targets) %>%
+  mutate(title = target_full_names[target]) %>%
+  left_join(wwtp_letters, by = c("wastewater_treatment_plant.name" = "wwtp")) %>%
+  group_by(wastewater_treatment_plant.name) %>%
+  do(p = plot_ly(data = .,
+                 x = ~collection_date, 
+                 color = ~title,
+                 colors = target_full_spec_colors,
+                 height = 1123,
+                 width = 794,
+                 legendgroup = ~target,
+                 showlegend = ifelse(unique(.$wastewater_treatment_plant.name) == "ARA Werdhoelzli", T, F)) %>%
+       add_trace(y = ~load,
+                 type = "scatter",
+                 mode = "markers",
+                 marker = list(size = 3,
+                               symbol = "circle",
+                               line = list(width = 0.5),
+                               color = "white")) %>%
+       add_trace(y = ~load_median,
+                 name = "7-day Rolling Median",
+                 type = "scatter",
+                 mode = "lines",
+                 line = list(width = 1)) %>%
+       add_annotations(text = ~unique(city),
+                       x = 0.5,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "center",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12)) %>%
+       add_annotations(text = ~unique(letter),
+                       x = 0,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "left",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12,
+                                   weight = "bold")) %>%
+       layout(title = "",
+              xaxis = list(title = "",
+                           tickformat = "%b %y",
+                           tickangle = 0,
+                           tickfont = list(size = 10),
+                           gridcolor = "gray88"
+              ),
+              yaxis = list(title = "",
+                           range = c(0, flu.cutoff),
+                           exponentformat  = "power",
+                           dtick = flu.cutoff / 3,
+                           tickfont = list(size = 10),
+                           gridcolor = "gray88"))) %>% 
+  subplot(nrows = 5,
+          widths = c(1/3, 1/3, 1/3),
+          heights = c(1/5, 1/5, 1/5, 1/5, 1/5),
+          shareX = TRUE,
+          shareY = TRUE,
+          titleY = FALSE,
+          titleX = FALSE) %>%
+  layout(annotations = list(list(x = -0.15 , 
+                                 y = 0.5, 
+                                 text = "Viral RNA Load (gc person<sup>-1</sup> day<sup>-1</sup>)",
+                                 font = list(color = "black",
+                                             size = 12),
+                                 textangle = 270,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48)),
+         margin = m,
+         legend = list(orientation = "v",
+                       xanchor = "right",
+                       yanchor = "bottom",
+                       x = 1,
+                       y = 0, 
+                       xref = "paper",
+                       yref = "paper",
+                       bordercolor = "black",
+                       borderwidth = 1, 
+                       font = list(color = "black", 
+                                   size = 10)))
+
+save_image(p = flu.loads.plot, file = "Figure4.png", scale = 3)
+
+flu.loads.plot
+```
+
+Points cut-off from the visualisation
+
+```{r}
+avgData %>%
+  filter(target %in% flu.targets,
+         load > flu.cutoff) %>%
+  select(city, target, collection_date, load) %>%
+  print() %>%
+  write_csv(., "SupTable7-Fig4.csv")
+```
+
+### Viral RNA comparison between WWTPs
+
+```{r}
+wwtps.loads.plot <- avgData %>%
+  filter(target != "SARS-N2", target != "MHV") %>%
+  mutate(title = target_full_names[target],
+         letter = target_letters[target]) %>%
+  group_by(target) %>%
+  do(p = plot_ly(data = .,
+                 x = ~collection_date,
+                 y = ~load_median,
+                 color = ~city,
+                 colors = wwtp_colors,
+                 type = "scatter",
+                 mode = "lines",
+                 line  = list(width = 1),
+                 height = 750,
+                 width = 750, 
+                 legendgroup = ~city,
+                 showlegend = ifelse(unique(.$target) == "SARS-N1", T, F)) %>%
+       add_annotations(text = ~unique(title),
+                       x = 0.5,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "center",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12)) %>%
+       add_annotations(text = ~unique(letter),
+                       x = 0,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "left",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12,
+                                   weight = "bold")) %>%
+       layout(title = "",
+              xaxis = list(title = "",
+                           tickformat = "%b \n %y",
+                           nticks = 12,
+                           tickangle = 0,
+                           tickfont = list(size = 12),
+                           gridcolor = "gray88"),
+              yaxis = list(title = "",
+                           exponentformat  = "power"))) %>% 
+  subplot(nrows = 2,
+          shareX = TRUE,
+          shareY = FALSE,
+          titleY = FALSE,
+          titleX = FALSE) %>%
+  layout(annotations = list(list(x = -0.15 , 
+                                 y = 0.5, 
+                                 text = "Viral RNA load (gc person<sup>-1</sup> day<sup>-1</sup>)",
+                                 font = list(color = "black",
+                                             size = 12),
+                                 textangle = 270,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48)),
+         margin = m,
+         legend = list(orientation = "h",  
+                       xanchor = "center",  
+                       x = 0.5, 
+                       entrywidth = 15,
+                       traceorder = "normal"))
+
+save_image(p = wwtps.loads.plot, file = "SupFigure2.png", scale = 3)
+
+wwtps.loads.plot
+```
+
+#### Summary statistics
+
+Maximum value for load_median by treatment plant
+
+```{r}
+avgData %>%
+  filter(target != "MHV") %>%
+  group_by(target, city) %>%
+  summarize(max_load_median = max(load_median),
+            date = collection_date[which.max(load_median)],
+            .groups = 'drop') %>%
+  group_by(city) %>%
+  arrange(date) %>%
+  group_split()
+```
+
+Maximum value for load_median by target
+
+```{r}
+avgData %>%
+  filter(target != "MHV") %>%
+  group_by(target, city) %>%
+  summarize(max_load_median = max(load_median),
+            date = collection_date[which.max(load_median)],
+            .groups = 'drop') %>%
+  group_by(target) %>%
+  arrange(date) %>%
+  group_split()
+```
+
+## Loads vs Cases
+
+### Reported cases (mandatory reporting system)
+
+#### Country level (SARS-CoV-2 and Influenza)
+
+NOTE: country level includes Lichtenstein
+
+```{r cases-plots}
+cases.report.loads.plot <- list()
+
+for (i in 1:length(unique(swissAvgData$pathogen))) {
+  if (i == 3) next # skip RSV for which we have no data
+  
+  cases.report.loads.plot[[i]] <- plot_ly(data = filter(swissAvgData, pathogen == unique(swissAvgData$pathogen)[i]),
+                                          x = ~collection_date,
+                                          colors = pathogen_colors,
+                                          height = 562,
+                                          width = 794,
+                                          legendgroup = ~pathogen) %>%
+    add_trace(y = ~median_load,
+              color = ~pathogen,
+              name = "Median Daily Viral RNA Load",
+              yaxis = "y", 
+              type = "scatter",
+              mode = "markers",
+              marker = list(size = 3,
+                            symbol = "circle"),
+              name = ~pathogen) %>%
+    add_trace(y = ~load_median,
+              color = ~pathogen,
+              name = "7-day Rolling Median",
+              yaxis = "y",
+              type = "scatter",
+              mode = "lines",
+              line = list(width = 1)) %>%
+    add_trace(y = ~cases_per_person*1e6,
+              name = "Positive Cases",
+              yaxis = "y2", 
+              type = "scatter",
+              mode = "lines",
+              fill = "tozeroy",
+              line = list(width = 0),
+              color = I("grey")) %>%
+    layout(title = pathogen_full_names[unique(swissAvgData$pathogen)[i]],
+           yaxis2 = list(title = "Positive cases per million people",
+                         side = "right",
+                         overlaying = "y",
+                         rangemode = "tozero",
+                         exponentformat = "power",
+                         range = c(0, ~plyr::round_any(max(cases_per_person*1e6, na.rm = TRUE), 
+                                                       10, 
+                                                       f = ceiling)),
+                         tickmode = "linear",
+                         tick0 = 0,
+                         dtick = ~plyr::round_any(max(cases_per_person*1e6, na.rm = TRUE), 
+                                                  10, 
+                                                  f = ceiling)/5),
+           xaxis = list(title = "Date",
+                        tickformat = "%b %y",
+                        nticks = 10,
+                        range = c(as.Date("2023-07-01"), max(swissAvgData$collection_date))),
+           yaxis = list(title = "Median viral RNA load<br>(gc person<sup>-1</sup> day<sup>-1</sup>)",
+                        side = "left",
+                        exponentformat = "power",
+                        rangemode = "tozero",
+                        range = c(0, ~plyr::round_any(max(load_median, na.rm = TRUE), 
+                                                      10000000, 
+                                                      f = ceiling)),
+                        tickmode = "linear",
+                        tick0 = 0,
+                        dtick = ~plyr::round_any(max(load_median, na.rm = TRUE), 
+                                                 10000000, 
+                                                 f = ceiling)/5), 
+           margin = m,
+           legend = list(orientation = "h",
+                         xanchor = "center",
+                         x = 0.5,
+                         y = -0.18,
+                         traceorder = "normal",
+                         bgcolor = "rgba(255, 255, 255, 0.5)",
+                         bordercolor = "black",
+                         borderwidth = 1))
+}
+
+for(i in 1:length(cases.report.loads.plot)) {
+  if (i == 3) next
+  save_image(p = cases.report.loads.plot[[i]],
+             file = paste0("SupFigure3-", unique(swissAvgData$pathogen)[i], ".png"),
+             scale = 4)
+}
+
+cases.report.loads.plot
+```
+
+Points cut-off from visualisation
+
+```{r}
+for (i in 1:length(unique(swissAvgData$pathogen))) {
+  if (i == 3) next
+  swissAvgData %>%
+    filter(pathogen == unique(swissAvgData$pathogen)[i]) %>%
+    mutate(maxcase = plyr::round_any(max(cases_per_person*1e6, na.rm = TRUE), 10, f = ceiling)) %>%
+    filter(median_load > plyr::round_any(max(load_median), 10000000, f = ceiling)) %>%
+    print() %>%
+    write.csv(., paste0("SupTable7-FigS3-", unique(.$pathogen), ".csv"))
+}
+
+``` 
+
+##### Correlations
+
+Country level correlations for mandatory reporting system
+
+```{r}
+swissAvgDataWeek %>%
+  filter(pathogen != "RSV") %>%
+  group_by(pathogen) %>%
+  mutate(normality_loads = shapiro.test(weekAvg_load)$p.value,
+         normality_cases = shapiro.test(man_cases_per_person)$p.value,
+         spearman_rho = cor.test(man_cases_per_person,
+                                 weekMed_load,
+                                 method = "spearman")$estimate,
+         spearman_p = cor.test(man_cases_per_person,
+                               weekMed_load,
+                               method = "spearman")$p.value,
+         pearson_rho = cor.test(man_cases_per_person,
+                                weekMed_load,
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(man_cases_per_person,
+                              weekMed_load,
+                              method = "pearson")$p.value) %>%
+  select(-c(temporal, weekAvg_load, weekMed_load, sent_cases, man_cases, man_cases_per_person)) %>%
+  distinct() 
+
+swissAvgDataWeek %>% 
+  filter(pathogen != "RSV") %>%
+  group_by(pathogen) %>% 
+  do(model = lm(man_cases_per_person ~ weekAvg_load, data = .)) %>% 
+  select(pathogen, model) %>%
+  distinct() %>%
+  ungroup %>% 
+  transmute(pathogen, modelcoef = map(model, glance)) %>% 
+  unnest(modelcoef)
+```
+
+###### Split over two waves
+
+```{r}
+swissAvgDataWeek %>%
+  filter(temporal < "2024-W13", pathogen == "SARS") %>%
+  group_by(pathogen) %>%
+  mutate(normality_loads = shapiro.test(weekAvg_load)$p.value,
+         normality_cases = shapiro.test(man_cases_per_person)$p.value,
+         spearman_rho = cor.test(man_cases_per_person,
+                                 weekMed_load,
+                                 method = "spearman")$estimate,
+         spearman_p = cor.test(man_cases_per_person,
+                               weekMed_load,
+                               method = "spearman")$p.value,
+         pearson_rho = cor.test(man_cases_per_person,
+                                weekMed_load,
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(man_cases_per_person,
+                              weekMed_load,
+                              method = "pearson")$p.value) %>%
+  select(-c(temporal, weekAvg_load, weekMed_load, sent_cases, man_cases, man_cases_per_person)) %>%
+  distinct()
+
+swissAvgDataWeek %>%
+  filter(temporal >= "2024-W13", pathogen == "SARS") %>%
+  group_by(pathogen) %>%
+  mutate(normality_loads = shapiro.test(weekAvg_load)$p.value,
+         normality_cases = shapiro.test(man_cases_per_person)$p.value,
+         spearman_rho = cor.test(man_cases_per_person,
+                                 weekMed_load,
+                                 method = "spearman")$estimate,
+         spearman_p = cor.test(man_cases_per_person,
+                               weekMed_load,
+                               method = "spearman")$p.value,
+         pearson_rho = cor.test(man_cases_per_person,
+                                weekMed_load,
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(man_cases_per_person,
+                              weekMed_load,
+                              method = "pearson")$p.value) %>%
+  select(-c(temporal, weekAvg_load, weekMed_load, sent_cases, man_cases, man_cases_per_person)) %>%
+  distinct()
+```
+
+##### Time-lagged cross-correlation
+
+Country level time-lag correlations for mandatory reporting system
+
+```{r}
+max_lag <- 4 # define lag duration to investigate
+par(mfrow = c(2, 2)) # prepare to put plots together on one page
+
+# table of lag correlation coefficients
+swissAvgDataWeek %>%
+  filter(pathogen != "RSV") %>% # no RSV for mandatory reporting
+  group_by(pathogen) %>%
+  do(ccf = ccf(.$man_cases_per_person,
+               .$weekMed_load, 
+               lag.max = max_lag, 
+               plot = FALSE,
+               type = "correlation", 
+               col = "red",
+               main = pathogen_full_names[unique(.$pathogen)], 
+               ylab = "Correlation", 
+               xlab = "Lag (weeks)",
+               xlim = c(-max_lag, max_lag), 
+               ylim = c(-0.2, 1))) %>%
+  transmute(pathogen, 
+            lag = list(ccf$lag[ccf$lag >= 0]),
+            correlation = list(ccf$acf[ccf$lag >= 0])) %>%
+  unnest(cols = c(lag, correlation)) 
+```
+
+#### Cantonal level (SARS-Cov-2)
+
+```{r canton-plots}
+cases.report.canton.loads.plot <- list()
+
+for (i in 1:length(unique(cantonData$wastewater_treatment_plant.name))) {
+  cases.report.canton.loads.plot[[i]] <- plot_ly(data = filter(cantonData, 
+                                                               wastewater_treatment_plant.name ==
+                                                                 unique(cantonData$wastewater_treatment_plant.name)[i]),
+                                                 x = ~collection_date,
+                                                 height = 562,
+                                                 width = 794) %>%
+    add_trace(y = ~load,
+              name = "SARS-CoV-2 RNA Load",
+              yaxis = "y", 
+              type = "scatter",
+              mode = "markers",
+              marker = list(size = 3,
+                            symbol = "circle",
+                            color = "black")) %>%
+    add_trace(y = ~load_median,
+              name = "7-day Rolling Median",
+              yaxis = "y",
+              type = "scatter",
+              mode = "lines",
+              line = list(width = 1,
+                          color = "black")) %>%
+    add_trace(y = ~cases_per_person*1e6,
+              name = "Positive Cases",
+              yaxis = "y2", 
+              type = "scatter",
+              mode = "lines",
+              fill = "tozeroy",
+              line = list(width = 0),
+              color = I("grey")) %>%
+    layout(title = unique(cantonData$city)[i],
+           yaxis2 = list(title = "Positive cases per million people",
+                         side = "right",
+                         overlaying = "y",
+                         rangemode = "tozero",
+                         exponentformat = "power",
+                         range = c(0, ~plyr::round_any(max(cases_per_person*1e6, na.rm = TRUE), 
+                                                       50, 
+                                                       f = ceiling)),
+                         tickmode = "linear",
+                         tick0 = 0,
+                         dtick = ~plyr::round_any(max(cases_per_person*1e6, na.rm = TRUE), 
+                                                  50, 
+                                                  f = ceiling)/5),
+           xaxis = list(title = "Date",
+                        tickformat = "%b %y",
+                        nticks = 10,
+                        range = c(as.Date("2023-07-01"), max(cantonData$collection_date))),
+           yaxis = list(title = "SARS-CoV-2 RNA load<br>(gc person<sup>-1</sup> day<sup>-1</sup>)",
+                        side = "left",
+                        exponentformat = "power",
+                        rangemode = "tozero",
+                        range = c(0, ~plyr::round_any(max(load_median, na.rm = TRUE), 
+                                                      1e8, 
+                                                      f = ceiling)),
+                        tickmode = "linear",
+                        tick0 = 0,
+                        dtick = ~plyr::round_any(max(load_median, na.rm = TRUE), 
+                                                 1e8, 
+                                                 f = ceiling)/5), 
+           margin = m,
+           legend = list(orientation = "h",
+                         xanchor = "center",
+                         x = 0.5,
+                         y = -0.18,
+                         traceorder = "normal",
+                         bgcolor = "rgba(255, 255, 255, 0.5)",
+                         bordercolor = "black",
+                         borderwidth = 1))
+}
+
+cases.report.canton.loads.plot
+```
+
+##### Correlations
+
+Cantonal level correlations for mandatory reporting system
+
+``` {r}
+cantonDataWeek %>%
+  group_by(city) %>%
+  mutate(normality_loads = shapiro.test(weekAvg_load)$p.value,
+         normality_cases = shapiro.test(cases_per_person)$p.value,
+         spearman_rho = cor.test(cases_per_person,
+                                 weekAvg_load,
+                                 method = "spearman")$estimate,
+         spearman_p = cor.test(cases_per_person,
+                               weekAvg_load,
+                               method = "spearman")$p.value,
+         pearson_rho = cor.test(cases_per_person,
+                                weekAvg_load,
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(cases_per_person,
+                              weekAvg_load,
+                              method = "pearson")$p.value) %>%
+  select(-c(temporal, weekAvg_load, cases, cases_per_person, 
+            wastewater_treatment_plant.name, georegion)) %>%
+  distinct() %>%
+  arrange(city) %>%
+  print() %>%
+  write.csv(., "SupTable3-weekly.csv", row.names = FALSE)
+
+
+cantonDataWeek %>% 
+  group_by(wastewater_treatment_plant.name) %>% 
+  do(model = lm(cases_per_person ~ weekAvg_load, data = .)) %>% 
+  select(wastewater_treatment_plant.name, model) %>%
+  distinct() %>%
+  ungroup %>% 
+  transmute(wastewater_treatment_plant.name, modelcoef = map(model, glance)) %>% 
+  unnest(modelcoef)
+```
+
+### Sentinella
+
+```{r sentinella-plots}
+sentinella.loads.plot <- list()
+
+for (i in 1:length(unique(swissAvgData$pathogen))) {
+  sentinella.loads.plot[[i]] <- plot_ly(data = filter(swissAvgData, pathogen == unique(swissAvgData$pathogen)[i]),
+                                        x = ~collection_date,
+                                        colors = pathogen_colors,
+                                        height = 562,
+                                        width = 794,
+                                        legendgroup = ~pathogen) %>%
+    add_trace(y = ~median_load,
+              color = ~pathogen,
+              name = "Median Daily Viral RNA Load",
+              yaxis = "y", 
+              type = "scatter",
+              mode = "markers",
+              marker = list(size = 3,
+                            symbol = "circle"),
+              name = ~pathogen) %>%
+    add_trace(y = ~load_median,
+              color = ~pathogen,
+              name = "7-day Rolling Median",
+              yaxis = "y",
+              type = "scatter",
+              mode = "lines",
+              line = list(width = 1)) %>%
+    add_trace(y = ~sentinella,
+              name = "Weekly Sentinella Cases",
+              yaxis = "y2", 
+              type = "scatter",
+              mode = "lines",
+              fill = "tozeroy",
+              line = list(width = 0),
+              color = I("grey")) %>%
+    layout(title = pathogen_full_names[unique(swissAvgData$pathogen)[i]],
+           yaxis2 = list(title = "Positive cases from Sentinella",
+                         side = "right",
+                         overlaying = "y", 
+                         rangemode = "tozero",
+                         range = c(0, ~plyr::round_any(max(sentinella, na.rm = TRUE), 
+                                                       10, 
+                                                       f = ceiling)),
+                         tickmode = "linear",
+                         tick0 = 0,
+                         dtick = ~plyr::round_any(max(sentinella, na.rm = TRUE), 
+                                                  10, 
+                                                  f = ceiling)/5),
+           xaxis = list(title = "Date",
+                        tickformat = "%b %y",
+                        nticks = 10,
+                        range = c(as.Date("2023-07-01"), max(swissAvgData$collection_date))),
+           yaxis = list(title = "Median viral RNA load<br>(gc person<sup>-1</sup> day<sup>-1</sup>)",
+                        side = "left",
+                        exponentformat = "power",
+                        rangemode = "tozero",
+                        range = c(0, ~plyr::round_any(max(load_median, na.rm = TRUE), 
+                                                      10000000, 
+                                                      f = ceiling)),
+                        tickmode = "linear",
+                        tick0 = 0,
+                        dtick = ~plyr::round_any(max(load_median, na.rm = TRUE), 
+                                                 10000000, 
+                                                 f = ceiling)/5), 
+           margin = m,
+           legend = list(orientation = "h",
+                         xanchor = "center",
+                         x = 0.5,
+                         y = -0.18,
+                         traceorder = "normal",
+                         bgcolor = "rgba(255, 255, 255, 0.5)",
+                         bordercolor = "black",
+                         borderwidth = 1))
+}
+
+for(i in 1:length(sentinella.loads.plot)) {
+  save_image(p = sentinella.loads.plot[[i]], 
+             file = paste0("Figure5-", unique(swissAvgData$pathogen)[i], ".png"), 
+             scale = 4)
+}
+
+sentinella.loads.plot
+```
+
+Points cut-off from visualisation
+
+```{r}
+for (i in 1:length(unique(swissAvgData$pathogen))) {
+  swissAvgData %>%
+    filter(pathogen == unique(swissAvgData$pathogen)[i]) %>%
+    mutate(maxcase = plyr::round_any(max(sentinella, na.rm = TRUE), 10, f = ceiling)) %>%
+    filter(median_load > plyr::round_any(max(load_median), 10000000, f = ceiling)) %>%
+    print() %>%
+    write.csv(., paste0("SupTable7-Fig5-", unique(.$pathogen), ".csv"))
+}
+
+```
+
+#### Correlations
+
+Country level correlations for Sentinella system
+
+```{r}
+swissAvgDataWeek %>%
+  group_by(pathogen) %>%
+  mutate(normality_loads = shapiro.test(weekAvg_load)$p.value,
+         normality_cases = shapiro.test(sent_cases)$p.value,
+         spearman_rho = cor.test(sent_cases,
+                                 weekMed_load,
+                                 method = "spearman")$estimate,
+         spearman_p = cor.test(sent_cases,
+                               weekMed_load,
+                               method = "spearman")$p.value,
+         pearson_rho = cor.test(sent_cases,
+                                weekMed_load,
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(sent_cases,
+                              weekMed_load,
+                              method = "pearson")$p.value) %>%
+  select(-c(temporal, weekAvg_load, weekMed_load, sent_cases, man_cases, man_cases_per_person)) %>%
+  distinct()
+
+swissAvgDataWeek %>% 
+  group_by(pathogen) %>% 
+  do(model = lm(sent_cases ~ weekAvg_load, data = .)) %>% 
+  select(pathogen, model) %>%
+  distinct() %>%
+  ungroup %>% 
+  transmute(pathogen, modelcoef = map(model, glance)) %>% 
+  unnest(modelcoef)
+```
+
+##### Split over two waves for SARS
+
+```{r}
+swissAvgDataWeek %>%
+  filter(temporal < "2024-W13", pathogen == "SARS") %>%
+  group_by(pathogen) %>%
+  mutate(normality_loads = shapiro.test(weekAvg_load)$p.value,
+         normality_cases = shapiro.test(sent_cases)$p.value,
+         spearman_rho = cor.test(sent_cases,
+                                 weekMed_load,
+                                 method = "spearman")$estimate,
+         spearman_p = cor.test(sent_cases,
+                               weekMed_load,
+                               method = "spearman")$p.value,
+         pearson_rho = cor.test(sent_cases,
+                                weekMed_load,
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(sent_cases,
+                              weekMed_load,
+                              method = "pearson")$p.value) %>%
+  select(-c(temporal, weekAvg_load, weekMed_load, sent_cases, man_cases, man_cases_per_person)) %>%
+  distinct()
+
+swissAvgDataWeek %>%
+  filter(temporal >= "2024-W13", pathogen == "SARS") %>%
+  group_by(pathogen) %>%
+  mutate(normality_loads = shapiro.test(weekAvg_load)$p.value,
+         normality_cases = shapiro.test(sent_cases)$p.value,
+         spearman_rho = cor.test(sent_cases,
+                                 weekMed_load,
+                                 method = "spearman")$estimate,
+         spearman_p = cor.test(sent_cases,
+                               weekMed_load,
+                               method = "spearman")$p.value,
+         pearson_rho = cor.test(sent_cases,
+                                weekMed_load,
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(sent_cases,
+                              weekMed_load,
+                              method = "pearson")$p.value) %>%
+  select(-c(temporal, weekAvg_load, weekMed_load, sent_cases, man_cases, man_cases_per_person)) %>%
+  distinct()
+```
+
+#### Time-lagged cross-correlation
+
+Country level time-lag correlations for Sentinella system
+
+```{r}
+max_lag <- 4 # define lag duration to investigate
+par(mfrow = c(2, 2)) # prepare to put plots together on one page
+
+# table of lag correlation coefficients
+swissAvgDataWeek %>%
+  group_by(pathogen) %>%
+  do(ccf = ccf(.$sent_cases, 
+               .$weekMed_load, 
+               lag.max = max_lag, 
+               plot = FALSE,
+               type = "correlation", 
+               col = "red",
+               main = pathogen_full_names[unique(.$pathogen)], 
+               ylab = "Spearman Correlation", 
+               xlab = "Lag (weeks)",
+               xlim = c(-max_lag, max_lag), 
+               ylim = c(-0.2, 1))) %>%
+  transmute(pathogen, 
+            lag = list(ccf$lag[ccf$lag >= 0]),
+            correlation = list(ccf$acf[ccf$lag >= 0])) %>%
+  unnest(cols = c(lag, correlation)) %>%
+  mutate(across(c("correlation"), round, 2),
+         pathogen_short = pathogen,
+         pathogen = pathogen_full_names[pathogen]) %>%
+  {. ->> SentinellaTimeLag } %>%
+  print() %>%
+  write_csv(., "SupTable4.csv")
+```
+
+```{r}
+# Set axis limits 
+x_lim <- c(-1, max_lag+1)
+y_lim <- c(0, 1)
+
+sentinella.lags <- SentinellaTimeLag %>%
+  group_by(pathogen) %>%
+  do(p = plot_ly(., 
+                 x = ~lag, 
+                 y = ~correlation,
+                 color = ~pathogen_short,
+                 colors = pathogen_colors,
+                 type = 'bar',
+                 showlegend = FALSE) %>%
+       layout(title = "",
+              xaxis = list(title = "Lag Time (weeks)", 
+                           range = x_lim),
+              yaxis = list(title = "Pearson Correlation", 
+                           range = y_lim)) %>%
+       add_annotations(text = ~unique(pathogen),
+                       x = 0.5,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "center",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12))) %>%
+  subplot(nrows = 2,
+          widths = c(1/2, 1/2),
+          heights = c(1/2, 1/2),
+          margin = 0.07,
+          shareX = TRUE,
+          shareY = TRUE,
+          titleY = FALSE,
+          titleX = FALSE) %>%
+  layout(annotations = list(list(x = -0.1 , 
+                                 y = 0.5, 
+                                 text = "Pearson Correlation",
+                                 font = list(color = "black",
+                                             size = 12),
+                                 textangle = 270,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48),
+                            list(x = 0.5 , 
+                                 y = -0.2, 
+                                 text = "Lag (weeks)",
+                                 font = list(color = "black",
+                                             size = 12),
+                                 textangle = 0,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48)),
+         margin = m)
+
+save_image(p = sentinella.lags, file = "SupFigure4.png", scale = 3)
+
+sentinella.lags
+```
+
+### Sentinella vs Reporting correlation
+
+At the country level
+
+```{r}
+swissAvgData %>%
+  filter(pathogen != "RSV") %>% # no mandatory reporting data for RSV
+  group_by(pathogen, temporal) %>%
+  summarise(mean_sentinella = mean(sentinella, na.rm = TRUE),
+            mean_man = mean(value, na.rm = TRUE),
+            median_sentinella = median(sentinella, na.rm = TRUE),
+            median_man = median(value, na.rm = TRUE),
+            .groups = "drop") %>%
+  group_by(pathogen) %>%
+  mutate(pearson_cor = cor.test(mean_sentinella, 
+                                mean_man, 
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(mean_sentinella, 
+                              mean_man, 
+                              method = "pearson")$p.value) %>%
+  select(-c(temporal, mean_sentinella, mean_man, median_sentinella, median_man)) %>%
+  distinct()
+```
+
+## Daily cantonal cases (data shared by FOPH)
+
+### SARS-CoV-2
+
+```{r}
+sars.cases.daily.canton.loads.plot <- list()
+
+for (i in 1:length(unique(dailySARScantonal$wastewater_treatment_plant.name))) {
+  sars.cases.daily.canton.loads.plot[[i]] <- plot_ly(data = filter(dailySARScantonal, 
+                                                                   wastewater_treatment_plant.name ==
+                                                                     unique(dailySARScantonal$wastewater_treatment_plant.name)[i]),
+                                                     x = ~collection_date,
+                                                     height = 562,
+                                                     width = 794) %>%
+    add_trace(y = ~load,
+              name = "SARS-CoV-2 RNA Load",
+              yaxis = "y", 
+              type = "scatter",
+              mode = "markers",
+              marker = list(size = 3,
+                            symbol = "circle",
+                            color = pathogen_colors["SARS"])) %>%
+    add_trace(y = ~load_median,
+              name = "7-day Rolling Median",
+              yaxis = "y",
+              type = "scatter",
+              mode = "lines",
+              line = list(width = 1,
+                          color = pathogen_colors["SARS"])) %>%
+    add_trace(y = ~cases_pop,
+              name = "Positive Cases",
+              yaxis = "y2", 
+              type = "scatter",
+              mode = "lines",
+              fill = "tozeroy",
+              line = list(width = 0),
+              color = I("grey")) %>%
+    layout(title = unique(dailySARScantonal$city)[i],
+           yaxis2 = list(title = "Cases per 100'000 people",
+                         side = "right",
+                         overlaying = "y", 
+                         rangemode = "tozero",
+                         exponentformat = "power",
+                         range = c(0, ~plyr::round_any(max(cases_pop, na.rm = TRUE), 
+                                                       5, 
+                                                       f = ceiling)),
+                         tickmode = "linear",
+                         tick0 = 0,
+                         dtick = ~plyr::round_any(max(cases_pop, na.rm = TRUE), 
+                                                  5, 
+                                                  f = ceiling)/5),
+           xaxis = list(title = "Date",
+                        tickformat = "%b %y",
+                        nticks = 10,
+                        range = c(as.Date("2023-07-01"), max(dailySARScantonal$collection_date))),
+           yaxis = list(title = "SARS-CoV-2 RNA load<br>(gc person<sup>-1</sup> day<sup>-1</sup>)",
+                        side = "left",
+                        exponentformat = "power",
+                        rangemode = "tozero",
+                        range = c(0, ~plyr::round_any(max(load_median, na.rm = TRUE), 
+                                                      1e8, 
+                                                      f = ceiling)),
+                        tickmode = "linear",
+                        tick0 = 0,
+                        dtick = ~plyr::round_any(max(load_median, na.rm = TRUE), 
+                                                 1e8, 
+                                                 f = ceiling)/5), 
+           margin = m,
+           legend = list(orientation = "h",
+                         xanchor = "center",
+                         x = 0.5,
+                         y = -0.18,
+                         traceorder = "normal",
+                         bgcolor = "rgba(255, 255, 255, 0.5)",
+                         bordercolor = "black",
+                         borderwidth = 1))
+}
+
+sars.cases.daily.canton.loads.plot
+```
+
+#### Correlations
+
+```{r}
+dailySARScantonal %>%
+  group_by(city) %>%
+  mutate(normality_loads = shapiro.test(load)$p.value,
+         normality_cases = shapiro.test(cases_pop)$p.value,
+         spearman_rho = cor.test(cases_pop,
+                                 load,
+                                 method = "spearman")$estimate,
+         spearman_p = cor.test(cases_pop,
+                               load,
+                               method = "spearman")$p.value,
+         pearson_rho = cor.test(cases_pop,
+                                load,
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(cases_pop,
+                              load,
+                              method = "pearson")$p.value) %>%
+  select(-c(collection_date, canton, cant_pop, cases_pop, 
+            cases, positive, negative, positivity,
+            wastewater_treatment_plant.name, load, load_median)) %>%
+  distinct() %>%
+  arrange(city) %>%
+  write.csv(., "SupTable5-daily.csv", row.names = FALSE)
+
+dailySARScantonal %>% 
+  group_by(wastewater_treatment_plant.name) %>% 
+  do(model = lm(cases_pop ~ load, data = .)) %>% 
+  select(wastewater_treatment_plant.name, model) %>%
+  distinct() %>%
+  ungroup %>% 
+  transmute(wastewater_treatment_plant.name, modelcoef = map(model, glance)) %>% 
+  unnest(modelcoef)
+```
+
+```{r}
+dailySARScantonal %>%
+  group_by(city) %>%
+  mutate(normality_loads = shapiro.test(load)$p.value,
+         normality_cases = shapiro.test(cases_pop)$p.value,
+         spearman_rho = cor.test(cases_pop,
+                                 load,
+                                 method = "spearman")$estimate,
+         spearman_p = cor.test(cases_pop,
+                               load,
+                               method = "spearman")$p.value,
+         pearson_rho = cor.test(cases_pop,
+                                load,
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(cases_pop,
+                              load,
+                              method = "pearson")$p.value) %>%
+  select(-c(collection_date, canton, cases_pop, 
+            cases, wastewater_treatment_plant.name, load, load_median)) %>%
+  distinct() %>%
+  plot_ly(data = .,
+          x = ~cant_pop,
+          y = ~pearson_rho,
+          type = "scatter",
+          mode = "markers",
+          marker = list(size = 5,
+                        color = "#000000",
+                        opacity = 0.5),
+          width = 500,
+          height = 500)
+```
+
+##### Split two waves
+
+```{r}
+dailySARScantonal %>%
+  filter(collection_date < "2024-04-01") %>%
+  group_by(city) %>%
+  mutate(normality_loads = shapiro.test(load)$p.value,
+         normality_cases = shapiro.test(cases_pop)$p.value,
+         spearman_rho = cor.test(cases_pop,
+                                 load,
+                                 method = "spearman")$estimate,
+         spearman_p = cor.test(cases_pop,
+                               load,
+                               method = "spearman")$p.value,
+         pearson_rho = cor.test(cases_pop,
+                                load,
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(cases_pop,
+                              load,
+                              method = "pearson")$p.value) %>%
+  select(-c(collection_date, canton, cant_pop, cases_pop, 
+            cases, positive, negative, positivity,
+            wastewater_treatment_plant.name, load, load_median)) %>%
+  distinct() %>%
+  arrange(desc(spearman_rho))
+
+dailySARScantonal %>%
+  filter(collection_date >= "2024-04-01") %>%
+  group_by(city) %>%
+  mutate(normality_loads = shapiro.test(load)$p.value,
+         normality_cases = shapiro.test(cases_pop)$p.value,
+         spearman_rho = cor.test(cases_pop,
+                                 load,
+                                 method = "spearman")$estimate,
+         spearman_p = cor.test(cases_pop,
+                               load,
+                               method = "spearman")$p.value,
+         pearson_rho = cor.test(cases_pop,
+                                load,
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(cases_pop,
+                              load,
+                              method = "pearson")$p.value) %>%
+  select(-c(collection_date, canton, cant_pop, cases_pop, 
+            cases, positive, negative, positivity,
+            wastewater_treatment_plant.name, load, load_median)) %>%
+  distinct() %>%
+  arrange(desc(spearman_rho))
+```
+
+#### Time-lagged cross-correlation
+
+```{r}
+max_lag <- 14 # define lag duration to investigate
+
+# table of lag correlation coefficients
+dailySARScantonal %>%
+  drop_na() %>%
+  group_by(wastewater_treatment_plant.name,
+           city) %>%
+  do(ccf = ccf(.$cases_pop,
+               .$load,
+               lag.max = max_lag, 
+               plot = FALSE,
+               type = "correlation", 
+               col = "red",
+               main = unique(.$wastewater_treatment_plant.name), 
+               ylab = "Correlation", 
+               xlab = "Lag (days)",
+               xlim = c(0, max_lag), 
+               ylim = c(0, 1))) %>%
+  transmute(wastewater_treatment_plant.name, 
+            city,
+            lag = list(ccf$lag[ccf$lag >= 0]),
+            correlation = list(ccf$acf[ccf$lag >= 0])) %>%
+  unnest(cols = c(lag, correlation)) %>%
+  {. ->> dailySARScantonalTimeLag } %>%
+  group_by(city) %>%
+  slice_max(correlation) %>%
+  arrange(desc(lag))
+```
+
+``` {r}
+# Set axis limits 
+x_lim <- c(-1, max_lag+1)
+y_lim <- c(0, 1)
+
+dailySARScantonalTimeLag %>%
+  group_by(wastewater_treatment_plant.name) %>%
+  do(p = plot_ly(., 
+                 x = ~lag, 
+                 y = ~correlation, 
+                 type = 'bar',
+                 showlegend = FALSE) %>%
+       layout(title = "",
+              xaxis = list(title = "Lag Time (days)", 
+                           range = x_lim),
+              yaxis = list(title = "Spearman Correlation", 
+                           range = y_lim)) %>%
+       add_annotations(text = ~unique(city),
+                       x = 0.5,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "center",
+                       yanchor = "top",
+                       showarrow = FALSE,
+                       font = list(size = 12))) %>%
+  subplot(nrows = 7,
+          widths = c(1/2, 1/2),
+          heights = c(1/7, 1/7, 1/7, 1/7, 1/7, 1/7, 1/7),
+          shareX = TRUE,
+          shareY = TRUE,
+          titleY = FALSE,
+          titleX = FALSE) %>%
+  layout(annotations = list(list(x = -0.1 , 
+                                 y = 0.5, 
+                                 text = "Spearman Correlation",
+                                 font = list(color = "black",
+                                             size = 12),
+                                 textangle = 270,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48),
+                            list(x = 0.5 , 
+                                 y = -0.2, 
+                                 text = "Lag (days)",
+                                 font = list(color = "black",
+                                             size = 12),
+                                 textangle = 0,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48)),
+         margin = m)
+```
+
+```{r}
+daily.sars.cantonal.lag <- dailySARScantonalTimeLag %>%
+  group_by(wastewater_treatment_plant.name) %>%
+  do({model = loess(correlation ~ lag, 
+                    data = ., 
+                    span = 0.25)
+  data.frame(lag = .$lag, correlation_smoothed = predict(model))}) %>%
+  left_join(dailySARScantonalTimeLag, by = c("wastewater_treatment_plant.name", "lag")) %>%
+  plot_ly(.,
+          x = ~lag,
+          color = ~city) %>%
+  add_trace(y = ~correlation, 
+            color = ~city, 
+            type = 'scatter', 
+            mode = 'markers',
+            opacity = 0.6,
+            showlegend = FALSE) %>%
+  add_trace(y = ~correlation_smoothed,  
+            type = 'scatter', 
+            mode = 'lines') %>%
+  layout(title = list(text = '', 
+                      x = 0.5, 
+                      xanchor = 'center', 
+                      font = list(size = 16)),
+         xaxis = list(title = 'Lag Time (days)', 
+                      titlefont = list(size = 14), 
+                      range = c(0, max_lag)),  
+         yaxis = list(title = 'Pearson Correlation', 
+                      titlefont = list(size = 14), 
+                      range = c(0, 1)),
+         legend = list(title = list(text = 'City', 
+                                    font = list(size = 14)), 
+                       font = list(size = 12))
+  )
+
+daily.sars.cantonal.lag
+```
+
+### Influenza A
+
+```{r}
+iav.cases.daily.canton.loads.plot <- list()
+
+for (i in 1:length(unique(dailyIAVcantonal$wastewater_treatment_plant.name))) {
+  iav.cases.daily.canton.loads.plot[[i]] <- plot_ly(data = filter(dailyIAVcantonal, 
+                                                                  wastewater_treatment_plant.name ==
+                                                                    unique(dailyIAVcantonal$wastewater_treatment_plant.name)[i]),
+                                                    x = ~collection_date,
+                                                    height = 562,
+                                                    width = 794) %>%
+    add_trace(y = ~load,
+              name = "Influenza A RNA Load",
+              yaxis = "y", 
+              type = "scatter",
+              mode = "markers",
+              marker = list(size = 3,
+                            symbol = "circle",
+                            color = pathogen_colors["IAV"])) %>%
+    add_trace(y = ~load_median,
+              name = "7-day Rolling Median",
+              yaxis = "y",
+              type = "scatter",
+              mode = "lines",
+              line = list(width = 1,
+                          color = pathogen_colors["IAV"])) %>%
+    add_trace(y = ~cases_pop,
+              name = "Positive Cases",
+              yaxis = "y2",
+              type = "scatter",
+              mode = "lines",
+              fill = "tozeroy",
+              line = list(width = 0),
+              color = I("grey")) %>%
+    layout(title = unique(dailyIAVcantonal$city)[i],
+           yaxis2 = list(title = "Cases per 100'000 people",
+                         side = "right",
+                         overlaying = "y",
+                         rangemode = "tozero",
+                         exponentformat = "power",
+                         range = c(0, ~plyr::round_any(max(cases_pop, na.rm = TRUE), 
+                                                       5, 
+                                                       f = ceiling)),
+                         tickmode = "linear",
+                         tick0 = 0,
+                         dtick = ~plyr::round_any(max(cases_pop, na.rm = TRUE), 
+                                                  5, 
+                                                  f = ceiling)/5),
+           xaxis = list(title = "Date",
+                        tickformat = "%b %y",
+                        nticks = 10,
+                        range = c(as.Date("2023-07-01"), max(dailyIAVcantonal$collection_date))),
+           yaxis = list(title = "Influenza A RNA load<br>(gc person<sup>-1</sup> day<sup>-1</sup>)",
+                        side = "left",
+                        exponentformat = "power",
+                        rangemode = "tozero",
+                        range = c(0, ~plyr::round_any(max(load_median, na.rm = TRUE), 
+                                                      1e7, 
+                                                      f = ceiling)),
+                        tickmode = "linear",
+                        tick0 = 0,
+                        dtick = ~plyr::round_any(max(load_median, na.rm = TRUE), 
+                                                 1e7, 
+                                                 f = ceiling)/5), 
+           margin = m,
+           legend = list(orientation = "h",
+                         xanchor = "center",
+                         x = 0.5,
+                         y = -0.18,
+                         traceorder = "normal",
+                         bgcolor = "rgba(255, 255, 255, 0.5)",
+                         bordercolor = "black",
+                         borderwidth = 1))
+}
+
+iav.cases.daily.canton.loads.plot
+```
+
+#### Correlations
+
+```{r}
+dailyIAVcantonal %>%
+  group_by(city) %>%
+  mutate(normality_loads = shapiro.test(load)$p.value,
+         normality_cases = shapiro.test(cases_pop)$p.value,
+         spearman_rho = cor.test(cases_pop,
+                                 load,
+                                 method = "spearman")$estimate,
+         spearman_p = cor.test(cases_pop,
+                               load,
+                               method = "spearman")$p.value,
+         pearson_rho = cor.test(cases_pop,
+                                load,
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(cases_pop,
+                              load,
+                              method = "pearson")$p.value) %>%
+  select(-c(collection_date, canton, cant_pop, cases_pop, 
+            cases, wastewater_treatment_plant.name, load, load_median)) %>%
+  distinct() %>%
+  arrange(desc(pearson_rho))
+
+dailyIAVcantonal %>% 
+  group_by(wastewater_treatment_plant.name) %>% 
+  do(model = lm(cases_pop ~ load, data = .)) %>% 
+  select(wastewater_treatment_plant.name, model) %>%
+  distinct() %>%
+  ungroup %>% 
+  transmute(wastewater_treatment_plant.name, modelcoef = map(model, glance)) %>% 
+  unnest(modelcoef)
+```
+
+```{r}
+dailyIAVcantonal %>%
+  group_by(city) %>%
+  mutate(normality_loads = shapiro.test(load)$p.value,
+         normality_cases = shapiro.test(cases_pop)$p.value,
+         spearman_rho = cor.test(cases_pop,
+                                 load,
+                                 method = "spearman")$estimate,
+         spearman_p = cor.test(cases_pop,
+                               load,
+                               method = "spearman")$p.value,
+         pearson_rho = cor.test(cases_pop,
+                                load,
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(cases_pop,
+                              load,
+                              method = "pearson")$p.value) %>%
+  select(-c(collection_date, canton, cases_pop, 
+            cases, wastewater_treatment_plant.name, load, load_median)) %>%
+  distinct() %>%
+  plot_ly(data = .,
+          x = ~cant_pop,
+          y = ~pearson_rho,
+          type = "scatter",
+          mode = "markers",
+          marker = list(size = 5,
+                        color = "#000000",
+                        opacity = 0.5),
+          width = 500,
+          height = 500)
+```
+
+#### Time-lagged cross-correlation
+
+```{r}
+max_lag <- 14 # define lag duration to investigate
+
+# table of lag correlation coefficients
+dailyIAVcantonal %>%
+  drop_na() %>%
+  group_by(wastewater_treatment_plant.name,
+           city) %>%
+  do(ccf = ccf(.$cases_pop,
+               .$load, 
+               lag.max = max_lag, 
+               plot = FALSE,
+               type = "correlation", 
+               col = "red",
+               main = unique(.$wastewater_treatment_plant.name), 
+               ylab = "Correlation", 
+               xlab = "Lag (days)",
+               xlim = c(0, max_lag), 
+               ylim = c(0, 1))) %>%
+  transmute(wastewater_treatment_plant.name, 
+            city,
+            lag = list(ccf$lag[ccf$lag >= 0]),
+            correlation = list(ccf$acf[ccf$lag >= 0])) %>%
+  unnest(cols = c(lag, correlation)) %>%
+  {. ->> dailyIAVcantonalTimeLag } %>%
+  group_by(city) %>%
+  slice_max(correlation) %>%
+  arrange(desc(lag))
+```
+
+``` {r}
+# Set axis limits 
+x_lim <- c(-1, max_lag+1)
+y_lim <- c(0, 1)
+
+dailyIAVcantonalTimeLag %>%
+  group_by(wastewater_treatment_plant.name) %>%
+  do(p = plot_ly(., 
+                 x = ~lag, 
+                 y = ~correlation, 
+                 type = 'bar',
+                 showlegend = FALSE) %>%
+       layout(title = "",
+              xaxis = list(title = "Lag Time (days)", 
+                           range = x_lim),
+              yaxis = list(title = "Spearman Correlation", 
+                           range = y_lim)) %>%
+       add_annotations(text = ~unique(city),
+                       x = 0.5,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "center",
+                       yanchor = "top",
+                       showarrow = FALSE,
+                       font = list(size = 12))) %>%
+  subplot(nrows = 7,
+          widths = c(1/2, 1/2),
+          heights = c(1/7, 1/7, 1/7, 1/7, 1/7, 1/7, 1/7),
+          shareX = TRUE,
+          shareY = TRUE,
+          titleY = FALSE,
+          titleX = FALSE) %>%
+  layout(annotations = list(list(x = -0.1 , 
+                                 y = 0.5, 
+                                 text = "Spearman Correlation",
+                                 font = list(color = "black",
+                                             size = 12),
+                                 textangle = 270,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48),
+                            list(x = 0.5 , 
+                                 y = -0.2, 
+                                 text = "Lag (days)",
+                                 font = list(color = "black",
+                                             size = 12),
+                                 textangle = 0,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48)),
+         margin = m)
+```
+
+```{r}
+daily.iav.cantonal.lag <- dailyIAVcantonalTimeLag %>%
+  group_by(wastewater_treatment_plant.name) %>%
+  do({model = loess(correlation ~ lag, 
+                    data = ., 
+                    span = 0.25)
+  data.frame(lag = .$lag, correlation_smoothed = predict(model))}) %>%
+  left_join(dailyIAVcantonalTimeLag, by = c("wastewater_treatment_plant.name", "lag")) %>%
+  plot_ly(.,
+          x = ~lag,
+          color = ~city) %>%
+  add_trace(y = ~correlation, 
+            color = ~city, 
+            type = 'scatter', 
+            mode = 'markers',
+            opacity = 0.6,
+            showlegend = FALSE) %>%
+  add_trace(y = ~correlation_smoothed,  
+            type = 'scatter', 
+            mode = 'lines') %>%
+  layout(title = list(text = '', 
+                      x = 0.5, 
+                      xanchor = 'center', 
+                      font = list(size = 16)),
+         xaxis = list(title = 'Lag Time (days)', 
+                      titlefont = list(size = 14), 
+                      range = c(0, max_lag)),  
+         yaxis = list(title = 'Pearson Correlation', 
+                      titlefont = list(size = 14), 
+                      range = c(0, 1)),
+         legend = list(title = list(text = 'City', 
+                                    font = list(size = 14)), 
+                       font = list(size = 12))
+  )
+
+daily.iav.cantonal.lag
+```
+
+### Influenza B
+
+```{r}
+ibv.cases.daily.canton.loads.plot <- list()
+
+for (i in 1:length(unique(dailyIBVcantonal$wastewater_treatment_plant.name))) {
+  ibv.cases.daily.canton.loads.plot[[i]] <- plot_ly(data = filter(dailyIBVcantonal, 
+                                                                  wastewater_treatment_plant.name ==
+                                                                    unique(dailyIBVcantonal$wastewater_treatment_plant.name)[i]),
+                                                    x = ~collection_date,
+                                                    height = 562,
+                                                    width = 794) %>%
+    add_trace(y = ~load,
+              name = "Influenza B RNA Load",
+              yaxis = "y", 
+              type = "scatter",
+              mode = "markers",
+              marker = list(size = 3,
+                            symbol = "circle",
+                            color = pathogen_colors["IBV"])) %>%
+    add_trace(y = ~load_median,
+              name = "7-day Rolling Median",
+              yaxis = "y",
+              type = "scatter",
+              mode = "lines",
+              line = list(width = 1,
+                          color = pathogen_colors["IBV"])) %>%
+    add_trace(y = ~cases_pop,
+              name = "Positive Cases",
+              yaxis = "y2", 
+              type = "scatter",
+              mode = "lines",
+              fill = "tozeroy",
+              line = list(width = 0),
+              color = I("grey")) %>%
+    layout(title = unique(dailyIAVcantonal$city)[i],
+           yaxis2 = list(title = "Cases per 100'000 people",
+                         side = "right",
+                         overlaying = "y",
+                         rangemode = "tozero",
+                         exponentformat = "power",
+                         range = c(0, ~plyr::round_any(max(cases_pop, na.rm = TRUE), 
+                                                       1, 
+                                                       f = ceiling)),
+                         tickmode = "linear",
+                         tick0 = 0,
+                         dtick = ~plyr::round_any(max(cases_pop, na.rm = TRUE), 
+                                                  1, 
+                                                  f = ceiling)/5),
+           xaxis = list(title = "Date",
+                        tickformat = "%b %y",
+                        nticks = 10,
+                        range = c(as.Date("2023-07-01"), max(dailyIBVcantonal$collection_date))),
+           yaxis = list(title = "Influenza B RNA load<br>(gc person<sup>-1</sup> day<sup>-1</sup>)",
+                        side = "left",
+                        exponentformat = "power",
+                        rangemode = "tozero",
+                        range = c(0, ~plyr::round_any(max(load_median, na.rm = TRUE), 
+                                                      1e7, 
+                                                      f = ceiling)),
+                        tickmode = "linear",
+                        tick0 = 0,
+                        dtick = ~plyr::round_any(max(load_median, na.rm = TRUE), 
+                                                 1e7, 
+                                                 f = ceiling)/5),
+           margin = m,
+           legend = list(orientation = "h",
+                         xanchor = "center",
+                         x = 0.5,
+                         y = -0.18,
+                         traceorder = "normal",
+                         bgcolor = "rgba(255, 255, 255, 0.5)",
+                         bordercolor = "black",
+                         borderwidth = 1))
+}
+
+ibv.cases.daily.canton.loads.plot
+```
+
+#### Correlations
+
+```{r}
+dailyIBVcantonal %>%
+  group_by(city) %>%
+  mutate(normality_loads = shapiro.test(load)$p.value,
+         normality_cases = shapiro.test(cases_pop)$p.value,
+         spearman_rho = cor.test(cases_pop,
+                                 load,
+                                 method = "spearman")$estimate,
+         spearman_p = cor.test(cases_pop,
+                               load,
+                               method = "spearman")$p.value,
+         pearson_rho = cor.test(cases_pop,
+                                load,
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(cases_pop,
+                              load,
+                              method = "pearson")$p.value) %>%
+  select(-c(collection_date, canton, cant_pop, cases_pop, 
+            cases, wastewater_treatment_plant.name, load, load_median)) %>%
+  distinct() %>%
+  arrange(desc(pearson_rho))
+
+dailyIBVcantonal %>% 
+  group_by(wastewater_treatment_plant.name) %>% 
+  do(model = lm(cases_pop ~ load, data = .)) %>% 
+  select(wastewater_treatment_plant.name, model) %>%
+  distinct() %>%
+  ungroup %>% 
+  transmute(wastewater_treatment_plant.name, modelcoef = map(model, glance)) %>% 
+  unnest(modelcoef)
+```
+
+#### Time-lagged cross-correlation
+
+```{r}
+max_lag <- 14 # define lag duration to investigate
+
+# table of lag correlation coefficients
+dailyIBVcantonal %>%
+  drop_na() %>%
+  group_by(wastewater_treatment_plant.name,
+           city) %>%
+  do(ccf = ccf(.$cases_pop, 
+               .$load, 
+               lag.max = max_lag, 
+               plot = FALSE,
+               type = "correlation", 
+               col = "red",
+               main = unique(.$wastewater_treatment_plant.name), 
+               ylab = "Correlation", 
+               xlab = "Lag (days)",
+               xlim = c(0, max_lag), 
+               ylim = c(0, 1))) %>%
+  transmute(wastewater_treatment_plant.name, 
+            city,
+            lag = list(ccf$lag[ccf$lag >= 0]),
+            correlation = list(ccf$acf[ccf$lag >= 0])) %>%
+  unnest(cols = c(lag, correlation)) %>%
+  {. ->> dailyIBVcantonalTimeLag }%>%
+  group_by(city) %>%
+  slice_max(correlation) %>%
+  arrange(desc(lag))
+```
+
+``` {r}
+# Set axis limits 
+x_lim <- c(-1, max_lag+1)
+y_lim <- c(0, 1)
+
+dailyIBVcantonalTimeLag %>%
+  group_by(wastewater_treatment_plant.name) %>%
+  do(p = plot_ly(., 
+                 x = ~lag, 
+                 y = ~correlation, 
+                 type = 'bar',
+                 showlegend = FALSE) %>%
+       layout(title = "",
+              xaxis = list(title = "Lag Time (days)", 
+                           range = x_lim),
+              yaxis = list(title = "Spearman Correlation", 
+                           range = y_lim)) %>%
+       add_annotations(text = ~unique(city),
+                       x = 0.5,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "center",
+                       yanchor = "top",
+                       showarrow = FALSE,
+                       font = list(size = 12))) %>%
+  subplot(nrows = 7,
+          widths = c(1/2, 1/2),
+          heights = c(1/7, 1/7, 1/7, 1/7, 1/7, 1/7, 1/7),
+          shareX = TRUE,
+          shareY = TRUE,
+          titleY = FALSE,
+          titleX = FALSE) %>%
+  layout(annotations = list(list(x = -0.1 , 
+                                 y = 0.5, 
+                                 text = "Spearman Correlation",
+                                 font = list(color = "black",
+                                             size = 12),
+                                 textangle = 270,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48),
+                            list(x = 0.5 , 
+                                 y = -0.2, 
+                                 text = "Lag (days)",
+                                 font = list(color = "black",
+                                             size = 12),
+                                 textangle = 0,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48)),
+         margin = m)
+```
+
+```{r}
+daily.ibv.cantonal.lag <- dailyIBVcantonalTimeLag %>%
+  group_by(wastewater_treatment_plant.name) %>%
+  do({model = loess(correlation ~ lag, 
+                    data = ., 
+                    span = 0.25)
+  data.frame(lag = .$lag, correlation_smoothed = predict(model))}) %>%
+  left_join(dailyIBVcantonalTimeLag, by = c("wastewater_treatment_plant.name", "lag")) %>%
+  plot_ly(.,
+          x = ~lag,
+          color = ~city) %>%
+  add_trace(y = ~correlation, 
+            color = ~city, 
+            type = 'scatter', 
+            mode = 'markers',
+            opacity = 0.6,
+            showlegend = FALSE) %>%
+  add_trace(y = ~correlation_smoothed,  
+            type = 'scatter', 
+            mode = 'lines') %>%
+  layout(title = list(text = '', 
+                      x = 0.5, 
+                      xanchor = 'center', 
+                      font = list(size = 16)),
+         xaxis = list(title = 'Lag Time (days)', 
+                      titlefont = list(size = 14), 
+                      range = c(0, max_lag)),  
+         yaxis = list(title = 'Pearson Correlation', 
+                      titlefont = list(size = 14), 
+                      range = c(0, 1)),
+         legend = list(title = list(text = 'City', 
+                                    font = list(size = 14)), 
+                       font = list(size = 12))
+  )
+
+daily.ibv.cantonal.lag
+```
+
+## Daily catchment cases (SARS-CoV-2 only)
+
+Everything till now has been with weekly aggregated data. Here we see if there is more information we can gain from daily time resolution.
+
+``` {r}
+sars.cases.daily.catchment.loads.plot <- list()
+
+for (i in 1:length(unique(dailySARScatchment$wastewater_treatment_plant.name))) {
+  sars.cases.daily.catchment.loads.plot[[i]] <- plot_ly(data = filter(dailySARScatchment, 
+                                                                      wastewater_treatment_plant.name ==
+                                                                        unique(dailySARScatchment$wastewater_treatment_plant.name)[i]),
+                                                        x = ~collection_date,
+                                                        height = 562,
+                                                        width = 794,
+                                                        legendgroup = ~wastewater_treatment_plant.name) %>%
+    add_trace(y = ~load,
+              name = "SARS-CoV-2 RNA Loads",
+              yaxis = "y",
+              type = "scatter",
+              mode = "markers",
+              marker = list(size = 3,
+                            symbol = "circle",
+                            color = pathogen_colors["SARS"]),
+              name = ~city) %>%
+    add_trace(y = ~load_median,
+              name = "7-day Rolling Median",
+              yaxis = "y",
+              type = "scatter",
+              mode = "lines",
+              line = list(width = 1,
+                          color = pathogen_colors["SARS"])) %>%
+    add_trace(y = ~cases_pop,
+              name = "Positive Cases",
+              yaxis = "y2",
+              type = "scatter",
+              mode = "lines",
+              fill = "tozeroy",
+              line = list(width = 0),
+              color = I("grey")) %>%
+    layout(title = unique(dailySARScatchment$city)[i],
+           yaxis2 = list(title = "Cases per 100'000 people",
+                         side = "right",
+                         overlaying = "y",
+                         rangemode = "tozero",
+                         range = c(0, ~plyr::round_any(max(cases_pop, na.rm = TRUE), 5, f = ceiling)),
+                         tickmode = "linear",
+                         tick0 = 0,
+                         dtick = ~plyr::round_any(max(cases_pop, na.rm = TRUE), 5, f = ceiling)/5), 
+           xaxis = list(title = "Date",
+                        tickformat = "%b %y",
+                        nticks = 10,
+                        range = c(as.Date("2023-07-01"), max(dailySARScatchment$collection_date))),
+           yaxis = list(title = "SARS-CoV-2 RNA loads<br>(gc person<sup>-1</sup> day<sup>-1</sup>)",
+                        side = "left",
+                        exponentformat = "power",
+                        rangemode = "tozero",
+                        range = c(0, ~plyr::round_any(max(load_median, na.rm = TRUE), 1e8, f = ceiling)),
+                        tickmode = "linear",
+                        tick0 = 0,
+                        dtick = ~plyr::round_any(max(load_median, na.rm = TRUE), 1e8, f = ceiling)/5),
+           margin = m,
+           legend = list(orientation = "h",
+                         xanchor = "center",
+                         x = 0.5,
+                         y = -0.18,
+                         traceorder = "normal",
+                         bgcolor = "rgba(255, 255, 255, 0.5)",
+                         bordercolor = "black",
+                         borderwidth = 1))
+}
+
+sars.cases.daily.catchment.loads.plot
+```
+
+#### Correlations
+
+```{r}
+dailySARScatchment %>%
+  group_by(city) %>%
+  mutate(normality_loads = shapiro.test(load)$p.value,
+         normality_cases = shapiro.test(cases_pop)$p.value,
+         spearman_rho = cor.test(cases_pop,
+                                 load,
+                                 method = "spearman")$estimate,
+         spearman_p = cor.test(cases_pop,
+                               load,
+                               method = "spearman")$p.value,
+         pearson_rho = cor.test(cases_pop,
+                                load,
+                                method = "pearson")$estimate,
+         pearson_p = cor.test(cases_pop,
+                              load,
+                              method = "pearson")$p.value) %>%
+  select(-c(collection_date, canton, population, cases_pop, 
+            cases, positive, negative, positivity,
+            wastewater_treatment_plant.name, load, load_median)) %>%
+  distinct() %>%
+  arrange(desc(pearson_rho))
+
+dailySARScatchment %>% 
+  group_by(wastewater_treatment_plant.name) %>% 
+  do(model = lm(cases_pop ~ load, data = .)) %>% 
+  select(wastewater_treatment_plant.name, model) %>%
+  distinct() %>%
+  ungroup %>% 
+  transmute(wastewater_treatment_plant.name, modelcoef = map(model, glance)) %>% 
+  unnest(modelcoef)
+```
+
+#### Time-lagged cross-correlation
+
+```{r}
+max_lag <- 14 # define lag duration to investigate
+
+# table of lag correlation coefficients
+dailySARScatchment %>%
+  drop_na() %>%
+  group_by(wastewater_treatment_plant.name,
+           city) %>%
+  do(ccf = ccf(.$positivity, 
+               .$load, 
+               lag.max = max_lag, 
+               plot = FALSE,
+               type = "correlation", 
+               col = "red",
+               main = unique(.$wastewater_treatment_plant.name), 
+               ylab = "Correlation", 
+               xlab = "Lag (days)",
+               xlim = c(0, max_lag), 
+               ylim = c(0, 1))) %>%
+  transmute(wastewater_treatment_plant.name, 
+            city,
+            lag = list(ccf$lag[ccf$lag >= 0]),
+            correlation = list(ccf$acf[ccf$lag >= 0])) %>%
+  unnest(cols = c(lag, correlation)) %>%
+  {. ->> dailySARScatchmentTimeLag } %>%
+  group_by(city) %>%
+  slice_max(correlation) %>%
+  arrange(desc(lag))
+```
+
+``` {r}
+# Set axis limits 
+x_lim <- c(-1, max_lag+1)
+y_lim <- c(0, 1)
+
+dailySARScatchmentTimeLag %>%
+  group_by(wastewater_treatment_plant.name) %>%
+  do(p = plot_ly(., 
+                 x = ~lag, 
+                 y = ~correlation, 
+                 type = 'bar',
+                 showlegend = FALSE) %>%
+       layout(title = "",
+              xaxis = list(title = "Lag Time (days)", 
+                           range = x_lim),
+              yaxis = list(title = "Spearman Correlation", 
+                           range = y_lim)) %>%
+       add_annotations(text = ~unique(city),
+                       x = 0.5,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "center",
+                       yanchor = "top",
+                       showarrow = FALSE,
+                       font = list(size = 12))) %>%
+  subplot(nrows = 7,
+          widths = c(1/2, 1/2),
+          heights = c(1/7, 1/7, 1/7, 1/7, 1/7, 1/7, 1/7),
+          shareX = TRUE,
+          shareY = TRUE,
+          titleY = FALSE,
+          titleX = FALSE) %>%
+  layout(annotations = list(list(x = -0.1 , 
+                                 y = 0.5, 
+                                 text = "Spearman Correlation",
+                                 font = list(color = "black",
+                                             size = 12),
+                                 textangle = 270,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48),
+                            list(x = 0.5 , 
+                                 y = -0.2, 
+                                 text = "Lag (days)",
+                                 font = list(color = "black",
+                                             size = 12),
+                                 textangle = 0,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48)),
+         margin = m)
+```
+
+```{r}
+daily.sars.catchment.lag <- dailySARScatchmentTimeLag %>%
+  group_by(wastewater_treatment_plant.name) %>%
+  do({model = loess(correlation ~ lag, 
+                    data = ., 
+                    span = 0.25)
+  data.frame(lag = .$lag, correlation_smoothed = predict(model))}) %>%
+  left_join(dailySARScatchmentTimeLag, by = c("wastewater_treatment_plant.name", "lag")) %>%
+  plot_ly(.,
+          x = ~lag,
+          color = ~city) %>%
+  add_trace(y = ~correlation, 
+            type = 'scatter', 
+            mode = 'markers',
+            opacity = 0.6,
+            showlegend = FALSE) %>%
+  add_trace(y = ~correlation_smoothed, 
+            type = 'scatter', 
+            mode = 'lines') %>%
+  layout(title = list(text = '', 
+                      x = 0.5, 
+                      xanchor = 'center', 
+                      font = list(size = 16)),
+         xaxis = list(title = 'Lag Time (days)', 
+                      titlefont = list(size = 14), 
+                      range = c(0, max_lag)),  
+         yaxis = list(title = 'Pearson Correlation', 
+                      titlefont = list(size = 14), 
+                      range = c(0, 1)),
+         legend = list(title = list(text = 'City', 
+                                    font = list(size = 14)), 
+                       font = list(size = 12))
+  )
+
+daily.sars.catchment.lag
+```
