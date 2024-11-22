@@ -477,6 +477,14 @@ print(paste("Total chambers run:", normal + spiked + controls))
 Technical replicates that passed all quality control measures (total number of droplets, NTC, inhibition)
 
 ```{r}
+# Database issue: 10 chamber IDs both passed and failed - raw data checked and these chambers should have passed, therefore they are removed from fail counts
+double_data <- PCRdata %>%
+  filter(passed == "True") %>%
+  distinct(chamber_id) %>%
+  inner_join(filter(PCRdata, passed == "False")) %>%
+  distinct(chamber_id) %>%
+  pull(chamber_id)
+
 normal_passed <- PCRdata %>%
   filter(passed == "True") %>%
   distinct(chamber_id) %>%
@@ -484,21 +492,25 @@ normal_passed <- PCRdata %>%
 
 normal_failed <- PCRdata %>%
   filter(passed == "False") %>%
+  filter(!chamber_id %in% double_data) %>%
   distinct(chamber_id) %>%
   count()
 
 normal_failed_ntc <- PCRdata %>%
   filter(ntc_passed == "False") %>%
+  filter(!chamber_id %in% double_data) %>%
   distinct(chamber_id) %>%
   count()
 
 normal_failed_inhibition <- PCRdata %>%
   filter(inhibition_passed == "False") %>%
+  filter(!chamber_id %in% double_data) %>%
   distinct(chamber_id) %>%
   count()
 
 normal_failed_total_droplets <- PCRdata %>%
   filter(total_droplets_passed == "False") %>%
+  filter(!chamber_id %in% double_data) %>%
   distinct(chamber_id) %>%
   count()
 
@@ -857,6 +869,8 @@ equation <- paste0("y = ", round(intercept, 2), " + ", round(slope, 2), "x")
 r2 <- paste0("R² = ", round(r_squared, 2))
 
 # linear regression filtering out the outlier
+N1.N2.cutoff <- 4e6
+
 N1.N2.lm.filt <- lm(`SARS-N2` ~ `SARS-N1`, data = filter(N1.N2.plot.data, 
                                                          `SARS-N1` <= N1.N2.cutoff, 
                                                          `SARS-N2` <= N1.N2.cutoff))
