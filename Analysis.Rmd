@@ -10,12 +10,14 @@ knitr::opts_chunk$set(warning = FALSE, message = FALSE)
 
 # Intro
 
-This notebook generates summary statistics and plots for the manuscript “A six-plex digital PCR assay for monitoring respiratory viruses in Swiss wastewater”, which describes the development of the RESPV6 assay and its first year of implementation.
-Data is taken directly from the WISEdb (https://wisedb.ethz.ch), the Federal Office of Public Health in Switzerland (FOPH) public API (https://api.idd.bag.admin.ch/swagger-ui/api-doc.html) and from files shared directly from the FOPH .
-To run this locally you need to have an access token for the WISEdb API and the case data shared from the FOPH. Requests for a WISEdb API token can be made to the Pathogens and Human Health group at Eawag, case data must be requested from the FOPH directly.
+This notebook generates summary statistics and plots for the manuscript “A six-plex digital PCR assay for monitoring respiratory viruses in Swiss wastewater”, which describes the development of the RESPV6 assay and its first year of implementation. Data is taken directly from the WISEdb (<https://wisedb.ethz.ch>), the Federal Office of Public Health in Switzerland (FOPH) public API (<https://api.idd.bag.admin.ch/swagger-ui/api-doc.html>) and from files shared directly from the FOPH . To run this locally you need to have an access token for the WISEdb API and the case data shared from the FOPH. Requests for a WISEdb API token can be made to the Pathogens and Human Health group at Eawag, case data must be requested from the FOPH directly.
 
 ```{r libraries}
-reticulate::use_miniconda('r-reticulate') # See documentation for initial installation to make this work
+# First three lines should only need to be run once first time you use this code
+# reticulate::install_miniconda()
+# reticulate::conda_install('r-reticulate', 'python-kaleido')
+# reticulate::conda_install('r-reticulate', 'plotly', channel = 'plotly')
+reticulate::use_miniconda('r-reticulate')
 library(tidyverse)
 library(RCurl)
 library(jsonlite)
@@ -25,16 +27,224 @@ library(FSA)
 library(dunn.test)
 library(readxl)
 library(broom)
+library(ggpubr)
+library(car)
 ```
 
 # Data Import
+
+## Multiplex vs Singleplex
+
+```{r dpcr experiment import}
+comparison_raw <- read_xlsx("data/sixplex-singleplex-comparison.xlsx", sheet = "Results")
+```
+
+### Data modifications
+
+```{r}
+# Define thresholds for QC
+TOTAL_DROPLETS_THRESHOLD <- 15000
+POSITIVE_DROPLETS_THRESHOLD <- 3
+
+# Tidy data
+comparison_all <- comparison_raw %>%
+  select(
+    ChamberID,
+    SampleName, 
+    TotalNumberOfDroplets,
+    ends_with("_Concentration"),
+    ends_with("_NumberOfPositiveDroplets")
+  ) %>%
+  rename(
+    chamber_id = ChamberID,
+    sample_name = SampleName,
+    total_droplets = TotalNumberOfDroplets
+  ) %>%
+  pivot_longer(
+    cols = c(ends_with("_Concentration"), ends_with("_NumberOfPositiveDroplets")),
+    names_to = c("target", ".value"),
+    names_pattern = "(.*)_(Concentration|NumberOfPositiveDroplets)",
+  ) %>%
+  rename(
+    concentration = Concentration,
+    positive_droplets = NumberOfPositiveDroplets
+  ) %>%
+  group_by(sample_name, target) %>%
+  mutate(replicate = rank(chamber_id, ties.method = "random")) %>%
+  ungroup() %>%
+  mutate(
+    assay = str_extract(sample_name, "[^_]+"),
+    dilution = str_extract(sample_name, "(?<=_)[0-9:]+"),
+    type = ifelse(
+      grepl(pattern = "NTC", sample_name),
+      "NTC",
+      "sample"
+    )
+  )
+
+# NTC data
+comparison_ntc <- comparison_all %>%
+  filter(
+    type == "NTC",
+    total_droplets >= TOTAL_DROPLETS_THRESHOLD
+  ) %>%
+  group_by(assay, target) %>%
+  summarise(
+    max_positive_droplets_ntc = max(positive_droplets),
+    .groups = "drop"
+  )
+
+# Sample data
+comparison_sample <- comparison_all %>%
+  filter(
+    type == "sample",
+    (assay == "RESPV6") | (str_detect(target, assay))
+  ) %>%
+  left_join(
+    comparison_ntc,
+    by = join_by(assay, target)
+  ) %>%
+  mutate(
+    qc_passed = (total_droplets >= TOTAL_DROPLETS_THRESHOLD) & (max_positive_droplets_ntc < 3),
+    assay = ifelse(
+      assay %in% c("IAV", "IBV", "MHV", "RSV", "SARS-N1", "SARS-N2"), 
+      "singleplex",
+      assay
+    ),
+    across(c(assay, dilution, replicate), as.factor)
+  ) %>%
+  select(assay, dilution, target, replicate, concentration, qc_passed) 
+
+multi.single.plot.data <- comparison_sample %>%
+  filter(qc_passed) %>%
+  pivot_wider(
+    id_cols = c(dilution, target, replicate),
+    names_from = assay,
+    values_from = concentration,
+    names_prefix = "concentration_"
+  )
+```
+
+## LoD
+
+```{r lod experiment import}
+lod_raw <- read_xlsx("data/RESPV6-lod-experiment.xlsx", sheet = "Results")
+```
+
+### Data modifications
+
+```{r}
+# Define droplet detection threshold
+DETECTION_THRESHOLD <- 3
+
+lod_data <- lod_raw %>% 
+  pivot_longer(
+    cols = ends_with("Concentration") | ends_with("NumberOfPositiveDroplets"),
+    names_to = c("target", ".value"),
+    names_sep = "_(?=[^_]+$)"
+  ) %>%
+  rename(
+    chamber_id = ChamberID,
+    sample_name = SampleName,
+    total_droplets = TotalNumberOfDroplets,
+    positive_droplets = NumberOfPositiveDroplets,
+    concentration = Concentration
+  ) %>%
+  select(
+    chamber_id,
+    sample_name,
+    target,
+    total_droplets,
+    positive_droplets,
+    concentration
+  ) %>%
+  mutate(
+    detect = ifelse(positive_droplets >= DETECTION_THRESHOLD, 1, 0),
+    target_conc = case_when(
+      as.numeric(sample_name) == 6 ~ 31.25,
+      as.numeric(sample_name) == 3 ~ 15.63,
+      as.numeric(sample_name) == 1.5 ~ 7.81,
+      TRUE ~ NA_real_
+    ),
+    # if a sample has <3 droplets, then concentration is 0
+    gc_ul_rxn = ifelse(positive_droplets >= 3, concentration, 0),
+    gc_rxn = gc_ul_rxn * 25
+  ) %>%
+  filter(sample_name != "NTC")
+
+lod_summary <- lod_data %>%
+  group_by(target, target_conc) %>%
+  summarise(
+    avg_gc_rxn = mean(gc_rxn, na.rm = TRUE),
+    detects = sum(detect),
+    non_detects = n() - sum(detect),
+    detect_ratio = mean(detect),
+    .groups = "drop"
+  ) 
+```
+
+## Low abundant targets
+
+```{r abundance experiment import}
+abundance_raw_1 <- read_xlsx("data/low-abundant-targets-experiment-1.xlsx", sheet = "Results")
+abundance_raw_2 <- read_xlsx("data/low-abundant-targets-experiment-2.xlsx", sheet = "Results")
+```
+
+### Data modifications
+
+```{r}
+# Define thresholds for QC
+TOTAL_DROPLETS_THRESHOLD <- 15000
+POSITIVE_DROPLETS_THRESHOLD <- 3
+
+abundance_raw <- bind_rows(abundance_raw_1, abundance_raw_2) %>%
+  mutate(SampleName = ifelse(SampleName == "low", "Low", SampleName)) 
+
+# Tidy data
+abundance_all <- abundance_raw %>%
+  select(
+    ChamberID,
+    SampleName, 
+    TotalNumberOfDroplets,
+    ends_with("_Concentration"),
+    ends_with("_NumberOfPositiveDroplets")
+  ) %>%
+  rename(
+    chamber_id = ChamberID,
+    sample_name = SampleName,
+    total_droplets = TotalNumberOfDroplets
+  ) %>%
+  pivot_longer(
+    cols = c(ends_with("_Concentration"), ends_with("_NumberOfPositiveDroplets")),
+    names_to = c("target", ".value"),
+    names_pattern = "(.*)_(Concentration|NumberOfPositiveDroplets)",
+  ) %>%
+  rename(
+    concentration = Concentration,
+    positive_droplets = NumberOfPositiveDroplets
+  ) %>%
+  group_by(sample_name, target) %>%
+  mutate(replicate = rank(chamber_id, ties.method = "random"),
+         concentration = ifelse(positive_droplets < POSITIVE_DROPLETS_THRESHOLD,
+                                0,
+                                concentration)) %>%
+  ungroup()
+
+abundance.plot.data <- abundance_all %>%
+  mutate(spiked = ifelse(sample_name == sub("-.*", "", abundance_all$target), 
+                         TRUE, FALSE),
+         sample_name = factor(sample_name, 
+                              levels = c("NTC", "Low", "IAV", 
+                                         "IBV", "MHV", "RSV", "SARS"))) %>%
+  filter(sample_name != "NTC")
+```
 
 ## WISE database
 
 ```{r wisedb data import}
 # define date range for analysis
-from_date <- "2023-07-10"
-to_date <- "2024-07-22"
+FROM_DATE <- "2023-07-10"
+TO_DATE <- "2024-07-22"
 
 get_data <- function(url, token, accept) {
   full_url <- URLencode(url)
@@ -56,30 +266,30 @@ get_data <- function(url, token, accept) {
 
 # Configure API for reading data
 readRenviron(".env")
-api <- "https://wisedb.ethz.ch/api/"
+api <- "https://wisedb.ethz.ch/api/private/"
 token <- Sys.getenv("WISEDB_TOKEN")
 
 # URls for data
-pcr_url <- paste0(api, "export/dpcr/?spiked=False&from=", from_date, "&to=", to_date)
-spiked_url <- paste0(api, "export/dpcr/?spiked=True&from=", from_date, "&to=", to_date)
+pcr_url <- paste0(api, "export/dpcr/?spiked=False&from=", FROM_DATE, "&to=", TO_DATE)
+spiked_url <- paste0(api, "export/dpcr/?spiked=True&from=", FROM_DATE, "&to=", TO_DATE)
 controls_url <- paste0(api, "export/dpcr_control/")
-wwtp_url <- paste0(api, "export/wastewatertreatmentplant/?sampling=True")
+wwtp_url <- paste0(api, "metadata/wastewater_treatment_plant/?reporting=True")
 
-wwtp_cities <- list(
-  "ARA Werdhoelzli" = "Zurich",
-  "STEP Aire" = "Geneva",
-  "ARA Basel/Prorheno" = "Basel",
-  "STEP Vidy" = "Lausanne",
-  "ARA Region Bern" = "Bern",
-  "ARA Buholz" = "Lucerne",
-  "CDA Lugano" = "Lugano",
-  "ARA Zuchwil" = "Solothurn",
-  "ARA Altenrhein" = "Altenrhein",
-  "ARA Sensetal" = "Laupen",
-  "ARA Chur" = "Chur",
-  "STEP Neuchatel" = "Neuchatel",
-  "ARA Schwyz" = "Schwyz",
-  "STEP Porrentruy" = "Porrentruy"
+wwtp_cities <- c(
+  "ARA Werdhoelzli" ~ "Zurich",
+  "STEP Aire" ~ "Geneva",
+  "ARA Basel/Prorheno" ~ "Basel",
+  "STEP Vidy" ~ "Lausanne",
+  "ARA Region Bern" ~ "Bern",
+  "ARA Buholz" ~ "Lucerne",
+  "CDA Lugano" ~ "Lugano",
+  "ARA Zuchwil" ~ "Solothurn",
+  "ARA Altenrhein" ~ "Altenrhein",
+  "ARA Sensetal" ~ "Laupen",
+  "ARA Chur" ~ "Chur",
+  "STEP Neuchatel" ~ "Neuchatel",
+  "ARA Schwyz" ~ "Schwyz",
+  "STEP Porrentruy" ~ "Porrentruy"
 )
 
 # Load PCR data from API
@@ -88,14 +298,17 @@ PCRdata <- get_data(pcr_url, token, "text/csv") %>%
   mutate(collection_date = ymd(collection_date),
          inhibition = 1 - `1-inhibition`,
          dead_volume = (25 - 0.000519 * total_droplets) / 25, # inhibition reported for the paper is 1 - our calculated "inhibition"
-         city = recode(wastewater_treatment_plant.name, !!!wwtp_cities))
+         city = case_match(wastewater_treatment_plant.name, !!!wwtp_cities)) 
 
 Spikeddata <- get_data(spiked_url, token, "text/csv") %>%
-  mutate(collection_date = ymd(collection_date))
+  mutate(collection_date = ymd(collection_date)) 
+
+controls_from <- min(ymd_hms(PCRdata$run_timestamp))
+controls_to <- max(ymd_hms(PCRdata$run_timestamp))
 
 Controldata <- get_data(controls_url, token, "text/csv") %>%
   mutate(run_timestamp = ymd_hms(run_timestamp)) %>%
-  filter(between(run_timestamp, ymd(from_date), ymd(to_date)))
+  filter(between(run_timestamp, controls_from, controls_to))
 
 # Load wwtp info from API
 wwtps <- get_data(wwtp_url, token, "application/json") %>%
@@ -123,7 +336,7 @@ avgData <- PCRdata %>%
            wastewater_treatment_plant.ara_id, 
            city,
            target, collection_date) %>%
-  summarise(load = mean(load, na.rm = TRUE), .groups = "drop") %>%
+  summarise(load = mean(load, na.rm = TRUE)) %>%
   ungroup() %>%
   group_by(wastewater_treatment_plant.name, target) %>%
   tidyr::complete(collection_date = full_seq(collection_date, period = 1),
@@ -316,7 +529,7 @@ CantonPop <- cantonData %>%
 ### SARS-Cov-2
 
 ```{r}
-dailySARScantonal <- read_csv("2024-08-19_covid_tests_cases_ktn_daily.csv", show_col_types = FALSE) %>%
+dailySARScantonal <- read_csv("data/2024-08-19_covid_tests_cases_ktn_daily.csv", show_col_types = FALSE) %>%
   rename(collection_date = date,
          canton_name = canton,
          canton = canton_abbr) %>%
@@ -325,7 +538,7 @@ dailySARScantonal <- read_csv("2024-08-19_covid_tests_cases_ktn_daily.csv", show
   rename(wastewater_treatment_plant.ara_id = ara_id) %>%
   left_join(filter(avgData, target == "SARS-N1"), 
             by = c("collection_date", "wastewater_treatment_plant.ara_id")) %>%
-  filter(collection_date >= from_date & collection_date <= to_date, # remove data from before ww monitoring
+  filter(collection_date >= FROM_DATE & collection_date <= TO_DATE, # remove data from before ww monitoring
          !is.na(wastewater_treatment_plant.name)) %>%
   left_join(CantonPop, by = c("wastewater_treatment_plant.ara_id", "canton")) %>%
   select(., collection_date, city, canton, cases, positive, negative, positivity, wastewater_treatment_plant.name, load, load_median, cant_pop) %>%
@@ -335,7 +548,7 @@ dailySARScantonal <- read_csv("2024-08-19_covid_tests_cases_ktn_daily.csv", show
 ### Influenza A
 
 ```{r}
-dailyIAVcantonal <- read_csv("2024-08-19_influA_cases_ktn_daily.csv", show_col_types = FALSE) %>%
+dailyIAVcantonal <- read_csv("data/2024-08-19_influA_cases_ktn_daily.csv", show_col_types = FALSE) %>%
   rename(collection_date = date,
          canton_name = canton,
          canton = canton_abbr) %>%
@@ -344,7 +557,7 @@ dailyIAVcantonal <- read_csv("2024-08-19_influA_cases_ktn_daily.csv", show_col_t
   rename(wastewater_treatment_plant.ara_id = ara_id) %>%
   left_join(filter(avgData, target == "IAV-M"), 
             by = c("collection_date", "wastewater_treatment_plant.ara_id")) %>%
-  filter(collection_date >= from_date & collection_date <= to_date, # remove data from before ww monitoring
+  filter(collection_date >= FROM_DATE & collection_date <= TO_DATE, # remove data from before ww monitoring
          !is.na(wastewater_treatment_plant.name)) %>%
   left_join(CantonPop, by = c("wastewater_treatment_plant.ara_id", "canton")) %>%
   select(., collection_date, city, canton, cases, wastewater_treatment_plant.name, load, load_median, cant_pop) %>%
@@ -354,7 +567,7 @@ dailyIAVcantonal <- read_csv("2024-08-19_influA_cases_ktn_daily.csv", show_col_t
 ### Influenza B
 
 ```{r}
-dailyIBVcantonal <- read_csv("2024-08-19_influB_cases_ktn_daily.csv", show_col_types = FALSE) %>%
+dailyIBVcantonal <- read_csv("data/2024-08-19_influB_cases_ktn_daily.csv", show_col_types = FALSE) %>%
   rename(collection_date = date,
          canton_name = canton,
          canton = canton_abbr) %>%
@@ -363,7 +576,7 @@ dailyIBVcantonal <- read_csv("2024-08-19_influB_cases_ktn_daily.csv", show_col_t
   rename(wastewater_treatment_plant.ara_id = ara_id) %>%
   left_join(filter(avgData, target == "IBV-M"), 
             by = c("collection_date", "wastewater_treatment_plant.ara_id")) %>%
-  filter(collection_date >= from_date & collection_date <= to_date, # remove data from before ww monitoring
+  filter(collection_date >= FROM_DATE & collection_date <= TO_DATE, # remove data from before ww monitoring
          !is.na(wastewater_treatment_plant.name)) %>%
   left_join(CantonPop, by = c("wastewater_treatment_plant.ara_id", "canton")) %>%
   select(., collection_date, city, canton, cases, wastewater_treatment_plant.name, load, load_median, cant_pop) %>%
@@ -373,13 +586,13 @@ dailyIBVcantonal <- read_csv("2024-08-19_influB_cases_ktn_daily.csv", show_col_t
 ## Catchment daily data shared by FOPH (SARS-CoV-2 only)
 
 ```{r}
-dailySARScatchment <- read_csv("2024-08-19_covid_tests_cases_ara_daily.csv", show_col_types = FALSE) %>%
+dailySARScatchment <- read_csv("data/2024-08-19_covid_tests_cases_ara_daily.csv", show_col_types = FALSE) %>%
   rename(collection_date = date) %>%
   mutate(collection_date = ymd(collection_date)) %>%
   left_join(wwtps, by = "ara_id") %>%
   left_join(filter(avgData, target == "SARS-N1"), 
             by = c("collection_date", "ara_id" = "wastewater_treatment_plant.ara_id")) %>%
-  filter(collection_date >= from_date & collection_date <= to_date, # remove data from before ww monitoring
+  filter(collection_date >= FROM_DATE & collection_date <= TO_DATE, # remove data from before ww monitoring
          !is.na(wastewater_treatment_plant.name)) %>%
   select(., collection_date, city, canton, cases, positive, negative, positivity, wastewater_treatment_plant.name, load, load_median, population) %>%
   mutate(cases_pop = cases / population * 100000) # Express cases by 100'000 people
@@ -403,9 +616,9 @@ CantonPop %>%
 # define the margins for plots
 m <- list(
   l = 100,
-  r = 100,
+  r = 50,
   b = 100,
-  t = 100,
+  t = 50,
   pad = 4
 )
 
@@ -432,24 +645,497 @@ target_letters <- c("SARS-N1" = "D", "SARS-N2" = "E",
                     "IAV-M" = "A", "IBV-M" = "B", 
                     "RSV-N" = "C")
 
-# define colour palettes
-target_colors <- c("#0000FF", "#009999", "#E41A1C", "#006633", "#FA9600")
+pathogen_letters <- c("SARS" = "D",
+                      "IAV" = "A", "IBV" = "B", 
+                      "RSV" = "C")
+
+target_letters_mhv <- c("SARS-N1" = "E", "SARS-N2" = "F", 
+                        "IAV-M" = "A", "IBV-M" = "B", 
+                        "RSV-N" = "D", "MHV" = "C")
+
+# define colour palettes "#0000FF", "#009999"
+target_colors <- c("#0000AC", "#00E3DE", "#E41A1C", "#006633", "#FA9600")
 target_colors <- setNames(target_colors, c("SARS-N1", "SARS-N2", "IAV-M", "IBV-M", "RSV-N"))
 
-pathogen_colors <- c("#0000FF", "#E41A1C", "#006633", "#FA9600")
+pathogen_colors <- c("#0000AC", "#E41A1C", "#006633", "#FA9600")
 pathogen_colors <- setNames(pathogen_colors, c("SARS", "IAV", "IBV", "RSV"))
 
-target_full_spec_colors <- c("#0000FF", "#009999", "#E41A1C", "#006633", "#FA9600")
+target_full_spec_colors <- c("#0000AC", "#00E3DE", "#E41A1C", "#006633", "#FA9600")
 target_full_spec_colors <- setNames(target_full_spec_colors, 
                                     c("SARS-CoV-2 (N1)", "SARS-CoV-2 (N2)",  
                                       "Influenza A", "Influenza B", 
                                       "Respiratory Syncytial Virus"))
+
+target_full_spec_colors_mhv <- c("#0000AC", "#00E3DE", "#E41A1C", "#006633", "#FA9600", "#9D0162")
+target_full_spec_colors_mhv <- setNames(target_full_spec_colors_mhv, 
+                                    c("SARS-CoV-2 (N1)", "SARS-CoV-2 (N2)",  
+                                      "Influenza A", "Influenza B", 
+                                      "Respiratory Syncytial Virus", "Murine Hepatitus Virus"))
 
 wwtp_colors <- c(paletteer::paletteer_d("colorBlindness::paletteMartin")[-1])
 wwtp_colors <- setNames(wwtp_colors, unique(PCRdata$city))
 ```
 
 # Results
+
+## Multiplex vs Singleplex
+
+### Correlation
+
+```{r}
+multi.single.lm <- multi.single.plot.data %>%
+  group_by(target) %>%
+  do({
+    model = lm(concentration_RESPV6 ~ concentration_singleplex, 
+               data = mutate(., across(.cols = c(concentration_RESPV6, concentration_singleplex), 
+                                       .fns = log10)))
+    summary_model = summary(model)
+    
+    # Extract regression parameters
+    intercept = summary_model$coefficients[1, 1]
+    slope = summary_model$coefficients[2, 1]
+    r_squared = summary_model$r.squared
+    
+    # Predict confidence intervals
+    prediction = predict(model, newdata = group_by(., target, dilution) %>%
+                           summarise(concentration_RESPV6 = mean(concentration_RESPV6),
+                                     concentration_singleplex = mean(concentration_singleplex)), 
+                         interval = "confidence")
+    
+    output = prediction %>%
+      as.data.frame() %>%
+      mutate(intercept = intercept, 
+             slope = slope, 
+             r_squared = r_squared,
+             equation = paste0("y = ", round(intercept, 2), " + ", round(slope, 2), "x"),
+             r2 = paste0("R² = ", round(r_squared, 2)))
+  }) %>%
+  mutate(dilution = as.factor(rep(c("1", "1:10", "1:100")))) %>%
+  bind_cols(group_by(multi.single.plot.data, target, dilution) %>%
+              summarise(mean_concentration_singleplex = mean(concentration_singleplex)) %>%
+              ungroup() %>%
+              select(mean_concentration_singleplex))
+```
+
+### Plot
+
+```{r}
+# plot data
+multi.single.plot <- multi.single.plot.data %>%
+  left_join(multi.single.lm) %>%
+  mutate(title = target_full_names_spec[target],
+         letter = target_letters_mhv[target],
+         title = ifelse(
+           target == "MHV",
+           "Murine Hepatitus Virus",
+           title)) %>%
+  group_by(target) %>%
+  do(p = plot_ly(data = .,
+                 color = ~title,
+                 colors = target_full_spec_colors_mhv,
+                 showlegend = FALSE) %>%
+       add_trace(x = ~concentration_singleplex,
+                 y = ~concentration_RESPV6,
+                 type = "scatter",
+                 mode = "markers",
+                 marker = list(size = 5,
+                               symbol = "circle",
+                               line = list(width = 1),
+                               color = "white")) %>%
+       add_lines(x = ~mean_concentration_singleplex,
+                 y = ~fit,
+                 color = ~unique(title),
+                 type = "scatter",
+                 mode = "lines",
+                 line = list(dash = "solid")) %>%
+       add_ribbons(x = ~mean_concentration_singleplex,
+                   ymin = ~lwr, 
+                   ymax = ~upr,
+                   line = list(color = 'rgba(0,0,0,0)')) %>%
+       add_annotations(text = ~unique(title),
+                       x = 0.5,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "center",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12)) %>%
+       add_text(text = ~paste0(unique(equation), "<br>", unique(r2)),
+                x = 10,
+                y = 100,
+                color = ~title,
+                yref = "paper",
+                xref = "paper",
+                xanchor = "left",
+                yanchor = "top",
+                showarrow = FALSE,
+                font = list(size = 12)) %>%
+       add_annotations(text = ~unique(letter),
+                       x = 0,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "left",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12,
+                                   weight = "bold")) %>%
+       layout(title = "",
+              xaxis = list(title = "",
+                           type = "log",
+                           tickangle = 0,
+                           dtick = "D3",
+                           tickfont = list(size = 12),
+                           gridcolor = "gray88"),
+              yaxis = list(title = "",
+                           type  = "log",
+                           dtick = "D3",
+                           tickfont = list(size = 12),
+                           gridcolor = "gray88"),
+              shapes = list(list(
+                type = "line",
+                x0 = 1,
+                x1 = ~max(concentration_RESPV6),
+                xref = "x",
+                y0 = 1,
+                y1 = ~max(concentration_RESPV6),
+                yref = "y",
+                line = list(color = "lightgrey",
+                            dash = "dash"))))) %>% 
+  subplot(nrows = 3,
+          margin = 0.05,
+          widths = c(1/2, 1/2),
+          heights = c(1/3, 1/3, 1/3),
+          shareX = FALSE,
+          shareY = FALSE,
+          titleY = FALSE,
+          titleX = FALSE) %>%
+  layout(annotations = list(list(x = -0.15 , 
+                                 y = 0.5, 
+                                 text = "Concentration from six-plex [gc/µL]",
+                                 font = list(color = "black",
+                                             size = 14),
+                                 textangle = 270,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48),
+                            list(x = 0.5, 
+                                 y = -0.05, 
+                                 text = "Concentration from single-plex [gc/µL]",
+                                 font = list(color = "black",
+                                             size = 14),
+                                 textangle = 0,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48)),
+         margin = m)
+
+multi.single.plot
+
+save_image(p = multi.single.plot, file = "figures/Figure2.png", width = 750, height = 1000, scale = 5)
+```
+
+### ANOVA
+
+```{r}
+for (t in unique(multi.single.plot.data$target)) {
+  cat(paste0("ANOVA for " , t, ": \n"))
+  comparison_sample_filtered <- comparison_sample %>% 
+    filter(target == t)
+  
+  fit_target <- lm(
+    log10(concentration) ~ assay + dilution,
+    comparison_sample_filtered
+  )
+  # print(summary(fit_target))
+  print(anova(fit_target))
+  
+  # Check assumptions:
+  car::qqPlot(fit_target)
+  plot(fit_target, which = 1)
+  
+  cat("######################################################### \n")
+}
+```
+
+## LoD analysis
+
+```{r}
+lod_data %>%
+  filter(sample_name != "NTC") %>%
+  ggplot(aes(x = factor(target_conc), 
+             y = gc_ul_rxn*25)) +
+  geom_boxplot(outlier.shape = NA, 
+               fill = "lightblue") +
+  stat_summary(fun = mean, 
+               geom = "point", 
+               shape = 20, 
+               color = "red", 
+               size = 3) +
+  facet_wrap(~ target) +
+  theme_bw() +
+  labs(
+    x = "Target Concentration [gc/rxn]",
+    y = "Measured Concentration [gc/rxn]"
+  )
+```
+
+### Probit analysis
+
+```{r}
+lod_probit <- lod_summary %>% 
+  group_by(target) %>%
+  do({
+    model = glm(formula = detect_ratio ~ avg_gc_rxn,
+                family = binomial(link = "probit"),
+                data = .)
+    
+    # Extract coefficients and calculate LoD
+    intercept = coef(model)["(Intercept)"]
+    slope = coef(model)[[2]] 
+    lod_95 = (qnorm(0.95) - intercept) / slope
+    
+    cat("Estimated LoD (95% detection):", lod_95, "\n")
+    
+    # Generate predictions
+    x_vals = seq(0, 50, by = 0.1)
+    newdata = data.frame(x = x_vals)
+    names(newdata) = "avg_gc_rxn"
+    
+    prediction = predict(model, newdata = newdata, type = "response")
+    
+    output <- as.data.frame(prediction,
+                            col.names = "prediction") %>%
+      mutate(lod_95 = lod_95,
+             input_pred = seq(0, 50, by = 0.1))
+  })
+```
+
+### Plot
+
+```{r}
+lod.plot <- lod_probit %>%
+  left_join(select(lod_summary, c(target, avg_gc_rxn, detect_ratio))) %>%
+  mutate(title = target_full_names_spec[target],
+         letter = target_letters_mhv[target],
+         title = ifelse(
+           target == "MHV",
+           "Murine Hepatitus Virus",
+           title)) %>%
+  group_by(target) %>%
+  do(p = plot_ly(data = .,
+                 color = ~title,
+                 colors = target_full_spec_colors_mhv,
+                 showlegend = FALSE) %>%
+       add_lines(x = ~input_pred,
+                 y = ~prediction,
+                 type = "scatter",
+                 mode = "lines",
+                 line = list(dash = "solid",
+                             color = "grey",
+                             width = 1)) %>%
+       add_trace(x = ~avg_gc_rxn,
+                 y = ~detect_ratio,
+                 type = "scatter",
+                 mode = "markers",
+                 marker = list(size = 5,
+                               symbol = "circle",
+                               line = list(width = 1),
+                               color = "white")) %>%
+       add_segments(x = ~lod_95,
+                    xend = ~lod_95,
+                    y = 0,
+                    yend = 1,
+                    line = list(color = "lightgrey",
+                                dash = "dash",
+                                width = 0.5)) %>%
+       add_segments(x = 0,
+                    xend = 50,
+                    y = 0.95,
+                    yend = 0.95,
+                    line = list(color = "lightgrey",
+                                dash = "dash",
+                                width = 0.5)) %>%
+       add_text(text = ~unique(round(lod_95, 2)),
+                x = ~lod_95,
+                y = 0.25,
+                color = ~title,
+                showarrow = FALSE,
+                font = list(size = 12)) %>%
+       add_annotations(text = ~unique(title),
+                       x = 0.5,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "center",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12)) %>%
+       add_annotations(text = ~unique(letter),
+                       x = 0,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "left",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12,
+                                   weight = "bold")) %>%
+       layout(title = "",
+              xaxis = list(title = "",
+                           tickangle = 0,
+                           range = c(0, 35),
+                           tickfont = list(size = 12),
+                           gridcolor = "gray88"),
+              yaxis = list(title = "",
+                           tickfont = list(size = 12),
+                           gridcolor = "gray88"))) %>% 
+  subplot(nrows = 3,
+          margin = 0.05,
+          widths = c(1/2, 1/2),
+          heights = c(1/3, 1/3, 1/3),
+          shareX = FALSE,
+          shareY = FALSE,
+          titleY = FALSE,
+          titleX = FALSE) %>%
+  layout(annotations = list(list(x = -0.1 , 
+                                 y = 0.5, 
+                                 text = "Detection Proportion",
+                                 font = list(color = "black",
+                                             size = 14),
+                                 textangle = 270,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48),
+                            list(x = 0.5, 
+                                 y = -0.05, 
+                                 text = "Mean Concentration [gc/rxn]",
+                                 font = list(color = "black",
+                                             size = 14),
+                                 textangle = 0,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48)),
+         margin = m)
+
+lod.plot
+
+save_image(p = lod.plot, file = "figures/SupFigure1.png", width = 750, height = 1000, scale = 5)
+```
+
+## Low abundant targets analysis
+
+### Plot
+
+```{r}
+# plot data
+abundance.plot <- abundance.plot.data %>%
+  mutate(title = target_full_names_spec[target],
+         letter = target_letters_mhv[target],
+         title = ifelse(
+           target == "MHV",
+           "Murine Hepatitus Virus",
+           title)) %>%
+  group_by(target) %>%
+  do(p = plot_ly(data = .,
+                 color = ~title,
+                 colors = target_full_spec_colors_mhv,
+                 showlegend = FALSE) %>%
+       add_boxplot(x = ~sample_name,
+                   y = ~concentration,
+                   boxpoints = "all",
+                   jitter = 0.7,
+                   pointpos = 0,
+                   marker = list(size = 5,
+                                 symbol = "circle",
+                                 line = list(width = 1),
+                                 color = "white")) %>%
+       add_annotations(text = ~unique(title),
+                       x = 0.5,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "center",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12)) %>%
+       add_annotations(text = ~unique(letter),
+                       x = 0,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "left",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12,
+                                   weight = "bold")) %>%
+       layout(title = "",
+              xaxis = list(title = "",
+                           tickangle = 0,
+                           tickfont = list(size = 12),
+                           gridcolor = "gray88"),
+              yaxis = list(title = "",
+                           type = "log",
+                           dtick = "D3",
+                           tickfont = list(size = 12),
+                           gridcolor = "gray88"))) %>% 
+  subplot(nrows = 3,
+          margin = 0.05,
+          widths = c(1/2, 1/2),
+          heights = c(1/3, 1/3, 1/3),
+          shareX = FALSE,
+          shareY = FALSE,
+          titleY = FALSE,
+          titleX = FALSE) %>%
+  layout(annotations = list(list(x = -0.15 , 
+                                 y = 0.5, 
+                                 text = "Concentration [gc/µL rxn]",
+                                 font = list(color = "black",
+                                             size = 14),
+                                 textangle = 270,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48),
+                            list(x = 0.5, 
+                                 y = -0.15, 
+                                 text = "Sample Name",
+                                 font = list(color = "black",
+                                             size = 14),
+                                 textangle = 0,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48)),
+         margin = m)
+
+abundance.plot
+
+save_image(p = abundance.plot, file = "figures/ReviewFigure1.png", width = 750, height = 750, scale = 5)
+```
+
+### ANOVA
+
+```{r}
+for (t in unique(abundance.plot.data$target)) {
+  cat(paste0("ANOVA for " , t, ": \n"))
+  abundance.plot.data.filtered <- abundance.plot.data %>% 
+    filter(target == t)
+  
+  anova_result <- aov(concentration ~ sample_name, 
+                    data = abundance.plot.data.filtered)
+  print(summary(anova_result))
+  
+  print(TukeyHSD(anova_result))
+  
+  cat("######################################################### \n")
+}
+```
 
 ## dPCR data quality and assay performance
 
@@ -520,6 +1206,7 @@ print(paste("Normal chambers failed due to inhibition:", normal_failed_inhibitio
 print(paste("Normal chambers failed due to droplets:", normal_failed_total_droplets, "(", round(normal_failed_total_droplets/normal_failed*100, digits = 2), "% )"))
 print(paste("Normal chambers failed due to NTCs:", normal_failed_ntc, "(", round(normal_failed_ntc/normal_failed*100, digits = 2), "% )"))
 ```
+
 Total number of wastewater samples analysed
 
 ```{r}
@@ -528,6 +1215,7 @@ PCRdata %>%
   distinct(collection_date, wastewater_treatment_plant.name) %>%
   count()
 ```
+
 Samples taken from only a single technical replicate.
 
 ```{r}
@@ -542,7 +1230,7 @@ PCRdata %>%
   count()
 ```
 
-### Partitions 
+### Partitions
 
 Descriptive statistics: non-spiked reactions
 
@@ -596,6 +1284,18 @@ Controldata %>%
 
 NOTE: calculated for all technical replicates
 
+Percentage of replicates above/below inhibition threshold
+
+```{r}
+PCRdata %>%
+  filter(target == "SARS-N1") %>%
+  group_by(wastewater_treatment_plant.name, collection_date) %>%
+  summarise(pass = ifelse(mean(inhibition) < 0.4, TRUE, FALSE)) %>%
+  ungroup() %>%
+  drop_na(pass) %>%
+  summarise(percent = sum(pass)/n())
+```
+
 Descriptive statistics: among all locations
 
 ```{r}
@@ -647,7 +1347,7 @@ df_inhibition %>%
                  mutate(significance = cut(P.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), 
                                            labels = c("***", "**", "*", ""))) %>%
                  print() %>%
-                 write.csv(., "SupTable1.csv", row.names = FALSE)
+                 write.csv(., "tables/SupTable2.csv", row.names = FALSE)
              )
            },
            "Kruskal-Wallis test is not significant; no need for Dunn's test." ) }
@@ -728,7 +1428,7 @@ df_recovery %>%
                  mutate(significance = cut(P.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), 
                                            labels = c("***", "**", "*", ""))) %>%
                  print() %>%
-                 write.csv(., "SupTable2.csv", row.names = FALSE))
+                 write.csv(., "tables/SupTable3.csv", row.names = FALSE))
            },
            "Kruskal-Wallis test is not significant; no need for Dunn's test." ) }
 ```
@@ -808,6 +1508,89 @@ PCRdata %>%
              )
            },
            "Kruskal-Wallis test is not significant; no need for Dunn's test." ) }
+```
+
+### CV of technical replicates
+
+```{r}
+cv.plot <- PCRdata %>%
+  filter(passed == "True") %>%
+  group_by(wastewater_treatment_plant.name, 
+           wastewater_treatment_plant.ara_id, 
+           city,
+           target, collection_date) %>%
+  summarise(cv = sd(gc_per_ul, na.rm = TRUE) / mean(gc_per_ul, na.rm = TRUE) * 100,
+            concentration = mean(gc_per_ul, na.rm = TRUE)) %>%
+  mutate(title = target_full_names_spec[target],
+         letter = target_letters_mhv[target],
+         title = ifelse(
+           target == "MHV",
+           "Murine Hepatitus Virus",
+           title)) %>%
+  group_by(target) %>%
+  do(p = plot_ly(data = .,
+                 color = ~title,
+                 colors = target_full_spec_colors_mhv,
+                 showlegend = FALSE) %>%
+       add_trace(x = ~concentration,
+                 y = ~cv,
+                 type = "scatter",
+                 mode = "markers",
+                 marker = list(size = 5,
+                               opacity = 0.5)) %>%
+       add_annotations(text = ~unique(title),
+                       x = 0.5,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "center",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12)) %>%
+       add_annotations(text = ~unique(letter),
+                       x = 0,
+                       y = 1,
+                       yref = "paper",
+                       xref = "paper",
+                       xanchor = "left",
+                       yanchor = "bottom",
+                       showarrow = FALSE,
+                       font = list(size = 12,
+                                   weight = "bold"))) %>% 
+  subplot(nrows = 3,
+          margin = 0.05,
+          widths = c(1/2, 1/2),
+          heights = c(1/3, 1/3, 1/3),
+          shareX = FALSE,
+          shareY = FALSE,
+          titleY = FALSE,
+          titleX = FALSE) %>%
+  layout(annotations = list(list(x = -0.15 , 
+                                 y = 0.5, 
+                                 text = "CV of technical replicates",
+                                 font = list(color = "black",
+                                             size = 14),
+                                 textangle = 270,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48),
+                            list(x = 0.5, 
+                                 y = -0.15, 
+                                 text = "Concentration [gc/µl rxn]",
+                                 font = list(color = "black",
+                                             size = 14),
+                                 textangle = 0,
+                                 showarrow = F, 
+                                 xref = 'paper', 
+                                 yref = 'paper', 
+                                 size = 48)),
+         margin = m)
+
+cv.plot
+
+save_image(p = cv.plot, file = "figures/ReviewFigure2.png", width = 750, height = 750, scale = 5)
+
 ```
 
 ## Detection of in wastewater samples
@@ -938,8 +1721,6 @@ N1.N2.plot <- plot_ly(data = N1.N2.plot.data) %>%
             showlegend = FALSE) %>%
   layout(title = "",
          autosize = F,
-         width = 750, 
-         height = 750,
          xaxis = list(title = "SARS-CoV-2 RNA concentration according to N1 gene [gc/Lww]",
                       titlefont = list(size = 14),
                       tickfont = list(size = 12),
@@ -951,7 +1732,7 @@ N1.N2.plot <- plot_ly(data = N1.N2.plot.data) %>%
                       automargin = "width",
                       titlefont = list(size = 14),
                       tickfont = list(size = 12),
-                      nticks=6,
+                      nticks = 6,
                       exponentformat  = "power",
                       type = "log"),
          margin = m,
@@ -989,7 +1770,7 @@ N1.N2.plot <- plot_ly(data = N1.N2.plot.data) %>%
            ))
   )
 
-save_image(p = N1.N2.plot, file = "Figure2.png", scale = 3)
+save_image(p = N1.N2.plot, file = "figures/Figure3.png", width = 750, height = 750, scale = 5)
 
 N1.N2.plot
 ```
@@ -1030,9 +1811,7 @@ N1.N2.ratio.plot <- N1.N2.ratio.plot.data %>%
   left_join(wwtp_letters, by = c("wastewater_treatment_plant.name" = "wwtp")) %>%
   group_by(wastewater_treatment_plant.name) %>%
   do(p = plot_ly(data = ., 
-                 x = ~collection_date,
-                 height = 1123,
-                 width = 794) %>%
+                 x = ~collection_date) %>%
        add_trace(y = ~ratio,
                  type = "scatter",
                  mode = "markers",
@@ -1120,7 +1899,7 @@ N1.N2.ratio.plot <- N1.N2.ratio.plot.data %>%
                        borderwidth = 1, 
                        font = list(color = "black", size = 12)))
 
-save_image(p = N1.N2.ratio.plot, file = "SupFigure1.png", scale = 3)
+save_image(p = N1.N2.ratio.plot, file = "figures/SupFigure2.png", width = 750, height = 1000, scale = 5)
 
 N1.N2.ratio.plot
 ```
@@ -1130,7 +1909,7 @@ N1.N2.ratio.plot.data %>%
   filter(ratio > ratio.cutoff) %>%
   select(city, collection_date, ratio) %>%
   print() %>%
-  write_csv(., "SupTable7-FigS1.csv")
+  write_csv(., "tables/SupTable7-FigS2.csv")
 ```
 
 ## Respiratory viruses loads
@@ -1151,8 +1930,6 @@ sars.loads.plot <- avgData %>%
                  x = ~collection_date, 
                  color = ~title,
                  colors = target_full_spec_colors,
-                 height = 1123,
-                 width = 794,
                  legendgroup = ~target,
                  showlegend = ifelse(unique(.$wastewater_treatment_plant.name) == "ARA Werdhoelzli", T, F)) %>%
        add_trace(y = ~load,
@@ -1211,9 +1988,9 @@ sars.loads.plot <- avgData %>%
           titleX = FALSE) %>%
   layout(annotations = list(list(x = -0.15 , 
                                  y = 0.5, 
-                                 text = "Viral RNA Load (gc person<sup>-1</sup> day<sup>-1</sup>)",
+                                 text = "Viral RNA Load [gc person<sup>-1</sup> day<sup>-1</sup>]",
                                  font = list(color = "black",
-                                             size = 12),
+                                             size = 14),
                                  textangle = 270,
                                  showarrow = F, 
                                  xref = 'paper', 
@@ -1231,7 +2008,7 @@ sars.loads.plot <- avgData %>%
                        borderwidth = 1, 
                        font = list(color = "black", size = 12)))
 
-save_image(p = sars.loads.plot, file = "Figure3.png", scale = 3)
+save_image(p = sars.loads.plot, file = "figures/Figure4.png", width = 750, height = 1000, scale = 5)
 
 sars.loads.plot
 ```
@@ -1244,7 +2021,7 @@ avgData %>%
          load > sars.cutoff) %>%
   select(city, target, collection_date, load) %>%
   print() %>%
-  write_csv(., "SupTable7-Fig3.csv")
+  write_csv(., "tables/SupTable7-Fig4.csv")
 ```
 
 ### Influenza and RSV
@@ -1261,8 +2038,6 @@ flu.loads.plot <- avgData %>%
                  x = ~collection_date, 
                  color = ~title,
                  colors = target_full_spec_colors,
-                 height = 1123,
-                 width = 794,
                  legendgroup = ~target,
                  showlegend = ifelse(unique(.$wastewater_treatment_plant.name) == "ARA Werdhoelzli", T, F)) %>%
        add_trace(y = ~load,
@@ -1318,9 +2093,9 @@ flu.loads.plot <- avgData %>%
           titleX = FALSE) %>%
   layout(annotations = list(list(x = -0.15 , 
                                  y = 0.5, 
-                                 text = "Viral RNA Load (gc person<sup>-1</sup> day<sup>-1</sup>)",
+                                 text = "Viral RNA Load [gc person<sup>-1</sup> day<sup>-1</sup>]",
                                  font = list(color = "black",
-                                             size = 12),
+                                             size = 14),
                                  textangle = 270,
                                  showarrow = F, 
                                  xref = 'paper', 
@@ -1339,7 +2114,7 @@ flu.loads.plot <- avgData %>%
                        font = list(color = "black", 
                                    size = 10)))
 
-save_image(p = flu.loads.plot, file = "Figure4.png", scale = 3)
+save_image(p = flu.loads.plot, file = "figures/Figure5.png", width = 750, height = 1000, scale = 5)
 
 flu.loads.plot
 ```
@@ -1352,7 +2127,7 @@ avgData %>%
          load > flu.cutoff) %>%
   select(city, target, collection_date, load) %>%
   print() %>%
-  write_csv(., "SupTable7-Fig4.csv")
+  write_csv(., "tables/SupTable7-Fig5.csv")
 ```
 
 ### Viral RNA comparison between WWTPs
@@ -1371,8 +2146,6 @@ wwtps.loads.plot <- avgData %>%
                  type = "scatter",
                  mode = "lines",
                  line  = list(width = 1),
-                 height = 750,
-                 width = 750, 
                  legendgroup = ~city,
                  showlegend = ifelse(unique(.$target) == "SARS-N1", T, F)) %>%
        add_annotations(text = ~unique(title),
@@ -1425,7 +2198,7 @@ wwtps.loads.plot <- avgData %>%
                        entrywidth = 15,
                        traceorder = "normal"))
 
-save_image(p = wwtps.loads.plot, file = "SupFigure2.png", scale = 3)
+save_image(p = wwtps.loads.plot, file = "figures/SupFigure3.png", width = 750, height = 750, scale = 5)
 
 wwtps.loads.plot
 ```
@@ -1477,8 +2250,6 @@ for (i in 1:length(unique(swissAvgData$pathogen))) {
   cases.report.loads.plot[[i]] <- plot_ly(data = filter(swissAvgData, pathogen == unique(swissAvgData$pathogen)[i]),
                                           x = ~collection_date,
                                           colors = pathogen_colors,
-                                          height = 562,
-                                          width = 794,
                                           legendgroup = ~pathogen) %>%
     add_trace(y = ~median_load,
               color = ~pathogen,
@@ -1507,7 +2278,6 @@ for (i in 1:length(unique(swissAvgData$pathogen))) {
     layout(title = pathogen_full_names[unique(swissAvgData$pathogen)[i]],
            yaxis2 = list(title = "Positive cases per million people",
                          side = "right",
-                         overlaying = "y",
                          rangemode = "tozero",
                          exponentformat = "power",
                          range = c(0, ~plyr::round_any(max(cases_per_person*1e6, na.rm = TRUE), 
@@ -1518,12 +2288,13 @@ for (i in 1:length(unique(swissAvgData$pathogen))) {
                          dtick = ~plyr::round_any(max(cases_per_person*1e6, na.rm = TRUE), 
                                                   10, 
                                                   f = ceiling)/5),
-           xaxis = list(title = "Date",
+           xaxis = list(title = "",
                         tickformat = "%b %y",
                         nticks = 10,
                         range = c(as.Date("2023-07-01"), max(swissAvgData$collection_date))),
            yaxis = list(title = "Median viral RNA load<br>(gc person<sup>-1</sup> day<sup>-1</sup>)",
                         side = "left",
+                        overlaying = "y2",
                         exponentformat = "power",
                         rangemode = "tozero",
                         range = c(0, ~plyr::round_any(max(load_median, na.rm = TRUE), 
@@ -1548,8 +2319,8 @@ for (i in 1:length(unique(swissAvgData$pathogen))) {
 for(i in 1:length(cases.report.loads.plot)) {
   if (i == 3) next
   save_image(p = cases.report.loads.plot[[i]],
-             file = paste0("SupFigure3-", unique(swissAvgData$pathogen)[i], ".png"),
-             scale = 4)
+             file = paste0("figures/SupFigure4-", unique(swissAvgData$pathogen)[i], ".png"),
+             width = 500, height = 375, scale = 5)
 }
 
 cases.report.loads.plot
@@ -1565,10 +2336,10 @@ for (i in 1:length(unique(swissAvgData$pathogen))) {
     mutate(maxcase = plyr::round_any(max(cases_per_person*1e6, na.rm = TRUE), 10, f = ceiling)) %>%
     filter(median_load > plyr::round_any(max(load_median), 10000000, f = ceiling)) %>%
     print() %>%
-    write.csv(., paste0("SupTable7-FigS3-", unique(.$pathogen), ".csv"))
+    write.csv(., paste0("tables/SupTable7-FigS4-", unique(.$pathogen), ".csv"))
 }
 
-``` 
+```
 
 ##### Correlations
 
@@ -1762,7 +2533,7 @@ cases.report.canton.loads.plot
 
 Cantonal level correlations for mandatory reporting system
 
-``` {r}
+```{r}
 cantonDataWeek %>%
   group_by(city) %>%
   mutate(normality_loads = shapiro.test(weekAvg_load)$p.value,
@@ -1784,7 +2555,7 @@ cantonDataWeek %>%
   distinct() %>%
   arrange(city) %>%
   print() %>%
-  write.csv(., "SupTable3-weekly.csv", row.names = FALSE)
+  write.csv(., "tables/SupTable4-weekly.csv", row.names = FALSE)
 
 
 cantonDataWeek %>% 
@@ -1806,9 +2577,7 @@ for (i in 1:length(unique(swissAvgData$pathogen))) {
   sentinella.loads.plot[[i]] <- plot_ly(data = filter(swissAvgData, pathogen == unique(swissAvgData$pathogen)[i]),
                                         x = ~collection_date,
                                         colors = pathogen_colors,
-                                        height = 562,
-                                        width = 794,
-                                        legendgroup = ~pathogen) %>%
+                                        showlegend = FALSE) %>%
     add_trace(y = ~median_load,
               color = ~pathogen,
               name = "Median Daily Viral RNA Load",
@@ -1836,7 +2605,6 @@ for (i in 1:length(unique(swissAvgData$pathogen))) {
     layout(title = pathogen_full_names[unique(swissAvgData$pathogen)[i]],
            yaxis2 = list(title = "Positive cases from Sentinella",
                          side = "right",
-                         overlaying = "y", 
                          rangemode = "tozero",
                          range = c(0, ~plyr::round_any(max(sentinella, na.rm = TRUE), 
                                                        10, 
@@ -1846,12 +2614,13 @@ for (i in 1:length(unique(swissAvgData$pathogen))) {
                          dtick = ~plyr::round_any(max(sentinella, na.rm = TRUE), 
                                                   10, 
                                                   f = ceiling)/5),
-           xaxis = list(title = "Date",
+           xaxis = list(title = NA, 
                         tickformat = "%b %y",
                         nticks = 10,
                         range = c(as.Date("2023-07-01"), max(swissAvgData$collection_date))),
-           yaxis = list(title = "Median viral RNA load<br>(gc person<sup>-1</sup> day<sup>-1</sup>)",
+           yaxis = list(title = "Median viral RNA load<br>[gc person<sup>-1</sup> day<sup>-1</sup>]",
                         side = "left",
+                        overlaying = "y2",
                         exponentformat = "power",
                         rangemode = "tozero",
                         range = c(0, ~plyr::round_any(max(load_median, na.rm = TRUE), 
@@ -1862,22 +2631,53 @@ for (i in 1:length(unique(swissAvgData$pathogen))) {
                         dtick = ~plyr::round_any(max(load_median, na.rm = TRUE), 
                                                  10000000, 
                                                  f = ceiling)/5), 
-           margin = m,
-           legend = list(orientation = "h",
-                         xanchor = "center",
-                         x = 0.5,
-                         y = -0.18,
-                         traceorder = "normal",
-                         bgcolor = "rgba(255, 255, 255, 0.5)",
-                         bordercolor = "black",
-                         borderwidth = 1))
+           margin = m)
 }
+
+sentinella.loads.legend <- plot_ly(data = filter(swissAvgData, pathogen == "SARS"),
+                                   x = ~collection_date) %>%
+  add_trace(y = ~median_load,
+            name = "Median Daily Viral RNA Load",
+            yaxis = "y", 
+            type = "scatter",
+            mode = "markers",
+            marker = list(size = 3,
+                          color = "black",
+                          symbol = "circle"),
+            name = ~pathogen) %>%
+  add_trace(y = ~load_median,
+            name = "7-day Rolling Median",
+            yaxis = "y",
+            type = "scatter",
+            mode = "lines",
+            line = list(width = 1,
+                        color = "black")) %>%
+  add_trace(y = ~sentinella,
+            name = "Weekly Sentinella Cases",
+            yaxis = "y2", 
+            type = "scatter",
+            mode = "lines",
+            fill = "tozeroy",
+            line = list(width = 0),
+            color = I("grey")) %>%
+  layout(margin = m,
+         legend = list(orientation = "h",
+                       xanchor = "center",
+                       x = 0.5,
+                       y = -0.18,
+                       traceorder = "normal",
+                       bgcolor = "rgba(255, 255, 255, 0.5)",
+                       bordercolor = "black",
+                       borderwidth = 1))
+
 
 for(i in 1:length(sentinella.loads.plot)) {
   save_image(p = sentinella.loads.plot[[i]], 
-             file = paste0("Figure5-", unique(swissAvgData$pathogen)[i], ".png"), 
-             scale = 4)
+             file = paste0("figures/Figure6-", unique(swissAvgData$pathogen)[i], ".png"), 
+             width = 500, height = 375, scale = 5)
 }
+
+save_image(p = sentinella.loads.legend, file = "figures/Figure6-legend.png", width = 1000, height = 750, scale = 5)
 
 sentinella.loads.plot
 ```
@@ -1891,7 +2691,7 @@ for (i in 1:length(unique(swissAvgData$pathogen))) {
     mutate(maxcase = plyr::round_any(max(sentinella, na.rm = TRUE), 10, f = ceiling)) %>%
     filter(median_load > plyr::round_any(max(load_median), 10000000, f = ceiling)) %>%
     print() %>%
-    write.csv(., paste0("SupTable7-Fig5-", unique(.$pathogen), ".csv"))
+    write.csv(., paste0("tables/SupTable7-Fig6-", unique(.$pathogen), ".csv"))
 }
 
 ```
@@ -2005,7 +2805,7 @@ swissAvgDataWeek %>%
          pathogen = pathogen_full_names[pathogen]) %>%
   {. ->> SentinellaTimeLag } %>%
   print() %>%
-  write_csv(., "SupTable4.csv")
+  write_csv(., "tables/SupTable5.csv")
 ```
 
 ```{r}
@@ -2066,7 +2866,7 @@ sentinella.lags <- SentinellaTimeLag %>%
                                  size = 48)),
          margin = m)
 
-save_image(p = sentinella.lags, file = "SupFigure4.png", scale = 3)
+save_image(p = sentinella.lags, file = "figures/SupFigure5.png", width = 750, height = 1000, scale = 5)
 
 sentinella.lags
 ```
@@ -2200,7 +3000,8 @@ dailySARScantonal %>%
             wastewater_treatment_plant.name, load, load_median)) %>%
   distinct() %>%
   arrange(city) %>%
-  write.csv(., "SupTable5-daily.csv", row.names = FALSE)
+  print() %>%
+  write.csv(., "tables/SupTable4-daily.csv", row.names = FALSE)
 
 dailySARScantonal %>% 
   group_by(wastewater_treatment_plant.name) %>% 
@@ -2326,7 +3127,7 @@ dailySARScantonal %>%
   arrange(desc(lag))
 ```
 
-``` {r}
+```{r}
 # Set axis limits 
 x_lim <- c(-1, max_lag+1)
 y_lim <- c(0, 1)
@@ -2597,7 +3398,7 @@ dailyIAVcantonal %>%
   arrange(desc(lag))
 ```
 
-``` {r}
+```{r}
 # Set axis limits 
 x_lim <- c(-1, max_lag+1)
 y_lim <- c(0, 1)
@@ -2836,7 +3637,7 @@ dailyIBVcantonal %>%
   arrange(desc(lag))
 ```
 
-``` {r}
+```{r}
 # Set axis limits 
 x_lim <- c(-1, max_lag+1)
 y_lim <- c(0, 1)
@@ -2934,7 +3735,7 @@ daily.ibv.cantonal.lag
 
 Everything till now has been with weekly aggregated data. Here we see if there is more information we can gain from daily time resolution.
 
-``` {r}
+```{r}
 sars.cases.daily.catchment.loads.plot <- list()
 
 for (i in 1:length(unique(dailySARScatchment$wastewater_treatment_plant.name))) {
@@ -3071,7 +3872,7 @@ dailySARScatchment %>%
   arrange(desc(lag))
 ```
 
-``` {r}
+```{r}
 # Set axis limits 
 x_lim <- c(-1, max_lag+1)
 y_lim <- c(0, 1)

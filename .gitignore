@@ -1,0 +1,7 @@
+.env
+.Rhistory
+*.nb.html
+*.csv
+data/*cases*
+figures/*
+tables/*
