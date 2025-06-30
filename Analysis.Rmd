@@ -1528,6 +1528,13 @@ cv.plot <- PCRdata %>%
            "Murine Hepatitus Virus",
            title)) %>%
   group_by(target) %>%
+  drop_na(cv) %>%
+  arrange(concentration) %>%
+  mutate(limit = quantile(concentration, 0.997, na.rm = TRUE),
+         fit = predict(loess(cv ~ concentration, 
+                             span = 0.5, 
+                             na.action = "na.exclude")),
+         fit = ifelse(fit < 0, 0, fit)) %>%
   do(p = plot_ly(data = .,
                  color = ~title,
                  colors = target_full_spec_colors_mhv,
@@ -1538,6 +1545,11 @@ cv.plot <- PCRdata %>%
                  mode = "markers",
                  marker = list(size = 5,
                                opacity = 0.5)) %>%
+       add_trace(x = ~concentration,
+                 y = ~fit,
+                 type = "scatter",
+                 mode = "lines",
+                 line = list(color = "black")) %>%
        add_annotations(text = ~unique(title),
                        x = 0.5,
                        y = 1,
@@ -1556,7 +1568,8 @@ cv.plot <- PCRdata %>%
                        yanchor = "bottom",
                        showarrow = FALSE,
                        font = list(size = 12,
-                                   weight = "bold"))) %>% 
+                                   weight = "bold")) %>%
+       layout(xaxis = list(range = ~c(0, unique(limit))))) %>% 
   subplot(nrows = 3,
           margin = 0.05,
           widths = c(1/2, 1/2),
