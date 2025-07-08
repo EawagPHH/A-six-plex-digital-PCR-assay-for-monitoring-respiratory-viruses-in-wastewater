@@ -610,6 +610,30 @@ CantonPop %>%
   print()
 ```
 
+## Wastewater characteristics
+
+```{r ww characteristics import}
+ww_char_raw <- read_xlsx("data/additional-ww-characteristics.xlsx")
+```
+
+### Data modifications
+
+```{r}
+ww_char <- df_inhibition %>%
+  group_by(wastewater_treatment_plant.name, city) %>%
+  summarise(avg_inhibition = mean(inhibition, na.rm = TRUE),
+            .groups = "drop") %>%
+  left_join(ww_char_raw %>%
+              rename(wastewater_treatment_plant.name = ara_name)) %>%
+  mutate(cod = as.numeric(cod),
+         text_max = ifelse(avg_inhibition == max(avg_inhibition),
+                           city,
+                           NA),
+         text_min = ifelse(avg_inhibition == min(avg_inhibition),
+                           city,
+                           NA))
+```
+
 ## Plotting parameters
 
 ```{r plot-settings}
@@ -1116,7 +1140,7 @@ abundance.plot <- abundance.plot.data %>%
 
 abundance.plot
 
-save_image(p = abundance.plot, file = "figures/ReviewFigure1.png", width = 750, height = 750, scale = 5)
+save_image(p = abundance.plot, file = "figures/SupFigure2.png", width = 750, height = 750, scale = 5)
 ```
 
 ### ANOVA
@@ -1602,8 +1626,216 @@ cv.plot <- PCRdata %>%
 
 cv.plot
 
-save_image(p = cv.plot, file = "figures/ReviewFigure2.png", width = 750, height = 750, scale = 5)
+save_image(p = cv.plot, file = "figures/ReviewFigure1.png", width = 750, height = 750, scale = 5)
 
+```
+
+## Wastewater characteristics
+
+### Regression lines
+
+```{r}
+model_A = lm(cod ~ avg_inhibition,
+             data = ww_char,
+             na.action = "na.exclude")
+model_B = lm(cod ~ flow_per_capita,
+             data = ww_char,
+             na.action = "na.exclude")
+model_C = lm(proportion_industry ~ avg_inhibition,
+             data = ww_char,
+             na.action = "na.exclude")
+
+# Extract regression parameters
+intercept_A = summary(model_A)$coefficients[1, 1]
+slope_A = summary(model_A)$coefficients[2, 1]
+r_squared_A = summary(model_A)$r.squared
+equation_A = paste0("y = ", round(intercept_A, 2), " + ", round(slope_A, 2), "x")
+r2_A = paste0("R² = ", round(r_squared_A, 2))
+
+intercept_B = summary(model_B)$coefficients[1, 1]
+slope_B = summary(model_B)$coefficients[2, 1]
+r_squared_B = summary(model_B)$r.squared
+equation_B = paste0("y = ", round(intercept_B, 2), " + ", round(slope_B, 2), "x")
+r2_B = paste0("R² = ", round(r_squared_B, 2))
+
+intercept_C = summary(model_C)$coefficients[1, 1]
+slope_C = summary(model_C)$coefficients[2, 1]
+r_squared_C = summary(model_C)$r.squared
+equation_C = paste0("y = ", round(intercept_C, 2), " + ", round(slope_C, 2), "x")
+r2_C = paste0("R² = ", round(r_squared_C, 2))
+
+# Predict confidence intervals
+prediction_A = predict(model_A)
+prediction_B = predict(model_B)
+prediction_C = predict(model_C)
+
+ww_char_lm <- ww_char %>%
+  bind_cols(fit_A = prediction_A,
+            fit_B = prediction_B,
+            fit_C = prediction_C)
+```
+
+### Plot
+
+```{r}
+cod_inhib <- plot_ly(ww_char_lm,
+                     showlegend = FALSE) %>%
+  add_trace(x = ~avg_inhibition,
+            y = ~cod,
+            type = "scatter",
+            mode = "markers",
+            marker = list(color = "black")) %>%
+  add_text(x = ~avg_inhibition,
+           y = ~cod,
+           text = ~text_max,
+           textposition = "bottom left") %>%
+  add_text(x = ~avg_inhibition,
+           y = ~cod,
+           text = ~text_min,
+           textposition = "top right") %>%
+  add_lines(x = ~avg_inhibition,
+            y = ~fit_A,
+            type = "scatter",
+            mode = "lines",
+            line = list(color = "blue",
+                        dash = "solid"),
+            showlegend = FALSE) %>%
+  add_annotations(text = "A",
+                  x = 0,
+                  y = 1,
+                  yref = "paper",
+                  xref = "paper",
+                  xanchor = "left",
+                  yanchor = "bottom",
+                  showarrow = FALSE,
+                  font = list(size = 12,
+                              weight = "bold")) %>%
+  layout(xaxis = list(title = "Average Inhibition [%]",
+                      zeroline = FALSE),
+         yaxis = list(title = "Chemical Oxygen Demand [mg/L]"),
+         annotations = list(
+           list(
+             x = 0.1,
+             y = 1,
+             xref = "paper",
+             yref = "paper",
+             xanchor = "left",
+             yanchor = "top",
+             text = paste(equation_A, "<br>", r2_A),
+             showarrow = FALSE,
+             font = list(size = 10, color = "blue")
+           )))
+
+cod_flow <- plot_ly(ww_char_lm,
+                    showlegend = FALSE) %>%
+  add_trace(x = ~flow_per_capita,
+            y = ~cod,
+            type = "scatter",
+            mode = "markers",
+            marker = list(color = "black")) %>%
+  add_text(x = ~flow_per_capita,
+           y = ~cod,
+           text = ~text_max,
+           textposition = "bottom right") %>%
+  add_text(x = ~flow_per_capita,
+           y = ~cod,
+           text = ~text_min,
+           textposition = "top left") %>%
+  add_lines(x = ~flow_per_capita,
+            y = ~fit_B,
+            type = "scatter",
+            mode = "lines",
+            line = list(color = "blue",
+                        dash = "solid"),
+            showlegend = FALSE) %>%
+  add_annotations(text = "B",
+                  x = 0,
+                  y = 1,
+                  yref = "paper",
+                  xref = "paper",
+                  xanchor = "left",
+                  yanchor = "bottom",
+                  showarrow = FALSE,
+                  font = list(size = 12,
+                              weight = "bold")) %>%
+  layout(xaxis = list(title = "Flow per Capita [L person<sup>-1</sup>]",
+                      zeroline = FALSE),
+         yaxis = list(title = "Chemical Oxygen Demand [mg/L]"),
+         annotations = list(
+           list(
+             x = 1,
+             y = 1,
+             xref = "paper",
+             yref = "paper",
+             xanchor = "right",
+             yanchor = "top",
+             text = paste(equation_B, "<br>", r2_B),
+             showarrow = FALSE,
+             font = list(size = 10, color = "blue")
+           )))
+
+industry_inhib <- plot_ly(ww_char_lm,
+                          showlegend = FALSE) %>%
+  add_trace(x = ~avg_inhibition,
+            y = ~proportion_industry,
+            type = "scatter",
+            mode = "markers",
+            marker = list(color = "black")) %>%
+  add_text(x = ~avg_inhibition,
+           y = ~proportion_industry,
+           text = ~text_max,
+           textposition = "left") %>%
+  add_text(x = ~avg_inhibition,
+           y = ~proportion_industry,
+           text = ~text_min,
+           textposition = "right") %>%
+  add_lines(x = ~avg_inhibition,
+            y = ~fit_C,
+            type = "scatter",
+            mode = "lines",
+            line = list(color = "blue",
+                        dash = "solid"),
+            showlegend = FALSE) %>%
+  add_annotations(text = "C",
+                  x = 0,
+                  y = 1,
+                  yref = "paper",
+                  xref = "paper",
+                  xanchor = "left",
+                  yanchor = "bottom",
+                  showarrow = FALSE,
+                  font = list(size = 12,
+                              weight = "bold")) %>%
+  layout(xaxis = list(title = "Average Inhibition [%]",
+                      zeroline = FALSE),
+         yaxis = list(title = "Industry Proportion [%]"),
+         annotations = list(
+           list(
+             x = 0.1,
+             y = 1,
+             xref = "paper",
+             yref = "paper",
+             xanchor = "left",
+             yanchor = "top",
+             text = paste(equation_C, "<br>", r2_C),
+             showarrow = FALSE,
+             font = list(size = 10, color = "blue")
+           )))
+
+
+ww_char_plot <- subplot(cod_inhib, cod_flow, industry_inhib,
+                        nrows = 1,
+                        margin = 0.05,
+                        widths = c(1/3, 1/3, 1/3),
+                        heights = c(1),
+                        shareX = FALSE,
+                        shareY = FALSE,
+                        titleY = TRUE,
+                        titleX = TRUE)
+
+ww_char_plot
+
+save_image(p = ww_char_plot, file = "figures/SupFigureText1.png", width = 750, height = 300, scale = 5)
 ```
 
 ## Detection of in wastewater samples
@@ -1912,7 +2144,7 @@ N1.N2.ratio.plot <- N1.N2.ratio.plot.data %>%
                        borderwidth = 1, 
                        font = list(color = "black", size = 12)))
 
-save_image(p = N1.N2.ratio.plot, file = "figures/SupFigure2.png", width = 750, height = 1000, scale = 5)
+save_image(p = N1.N2.ratio.plot, file = "figures/SupFigure3.png", width = 750, height = 1000, scale = 5)
 
 N1.N2.ratio.plot
 ```
@@ -1922,7 +2154,7 @@ N1.N2.ratio.plot.data %>%
   filter(ratio > ratio.cutoff) %>%
   select(city, collection_date, ratio) %>%
   print() %>%
-  write_csv(., "tables/SupTable7-FigS2.csv")
+  write_csv(., "tables/SupTable7-FigS3.csv")
 ```
 
 ## Respiratory viruses loads
@@ -2211,7 +2443,7 @@ wwtps.loads.plot <- avgData %>%
                        entrywidth = 15,
                        traceorder = "normal"))
 
-save_image(p = wwtps.loads.plot, file = "figures/SupFigure3.png", width = 750, height = 750, scale = 5)
+save_image(p = wwtps.loads.plot, file = "figures/SupFigure4.png", width = 750, height = 750, scale = 5)
 
 wwtps.loads.plot
 ```
@@ -2332,7 +2564,7 @@ for (i in 1:length(unique(swissAvgData$pathogen))) {
 for(i in 1:length(cases.report.loads.plot)) {
   if (i == 3) next
   save_image(p = cases.report.loads.plot[[i]],
-             file = paste0("figures/SupFigure4-", unique(swissAvgData$pathogen)[i], ".png"),
+             file = paste0("figures/SupFigure5-", unique(swissAvgData$pathogen)[i], ".png"),
              width = 500, height = 375, scale = 5)
 }
 
@@ -2349,7 +2581,7 @@ for (i in 1:length(unique(swissAvgData$pathogen))) {
     mutate(maxcase = plyr::round_any(max(cases_per_person*1e6, na.rm = TRUE), 10, f = ceiling)) %>%
     filter(median_load > plyr::round_any(max(load_median), 10000000, f = ceiling)) %>%
     print() %>%
-    write.csv(., paste0("tables/SupTable7-FigS4-", unique(.$pathogen), ".csv"))
+    write.csv(., paste0("tables/SupTable7-FigS5-", unique(.$pathogen), ".csv"))
 }
 
 ```
@@ -2879,7 +3111,7 @@ sentinella.lags <- SentinellaTimeLag %>%
                                  size = 48)),
          margin = m)
 
-save_image(p = sentinella.lags, file = "figures/SupFigure5.png", width = 750, height = 1000, scale = 5)
+save_image(p = sentinella.lags, file = "figures/SupFigure6.png", width = 750, height = 1000, scale = 5)
 
 sentinella.lags
 ```
